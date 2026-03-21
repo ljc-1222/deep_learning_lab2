@@ -4,12 +4,11 @@ import torch
 import numpy as np
 import torchvision.transforms.functional as F
 
-from torch import nn
 from tqdm import tqdm
 from src.models.unet import UNet
 from torch.utils.data import DataLoader
+from src.utils import print_training_config
 from src.evaluate import dice_score, combined_loss
-from src.oxford_pet import OxfordPetDataset, train_transforms, val_transforms
 
 # Device and number of workers
 NUM_WORKERS = min(4, os.cpu_count())
@@ -19,23 +18,24 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 
 # Dataset hyperparameters
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 
 # Training hyperparameters
-NUM_EPOCHS = 100
-CE_LAMBDA   = 0.35   # loss = CE_LAMBDA * CE + (1 - CE_LAMBDA) * Dice
+NUM_EPOCHS  = 250
+DICE_WEIGHT = 1.3 
+TV_WEIGHT   = 0.4
 
 # Optimizer hyperparameters
 WEIGHT_DECAY = 1e-5
-LEARNING_RATE = 1e-2
+LEARNING_RATE = 1e-3
 
 # Scheduler hyperparameters
 GAMMA = 0.1
 STEP_SIZE = 10
 
 # Early stopping hyperparameters
-PATIENCE = 10
-DELTA = 0.001
+PATIENCE = 40
+FACTOR = 0.5
 
 # Set seed
 torch.manual_seed(SEED)
@@ -64,16 +64,11 @@ val_dataloader = DataLoader(val_dataset,
 
 model  = torch.compile(UNet().to(DEVICE))
 
-loss  = lambda output, target: combined_loss(output, target, 
-                                             ce_lambda = CE_LAMBDA)
+loss = lambda output, target: combined_loss(output, target, alpha = DICE_WEIGHT, beta = TV_WEIGHT)
 
-optimizer = torch.optim.AdamW(model.parameters(), 
-                              lr = LEARNING_RATE, 
-                              weight_decay = WEIGHT_DECAY)
+optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE, weight_decay = WEIGHT_DECAY)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 
-                                            step_size = STEP_SIZE, 
-                                            gamma = GAMMA)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'max', factor = FACTOR, patience = PATIENCE)
 
 def train_one_epoch(model, optimizer, scheduler, loss, train_dataloader):
     
@@ -95,7 +90,7 @@ def train_one_epoch(model, optimizer, scheduler, loss, train_dataloader):
         loss_value.backward()
         optimizer.step()
         
-    scheduler.step()
+    scheduler.step(epoch_dice_score)
         
     training_loss = training_loss / len(train_dataloader)
         
@@ -138,12 +133,27 @@ def validate_one_epoch(model, loss, val_dataloader):
     return validation_loss, epoch_dice_score
 
 if __name__ == "__main__":
-    
-    # Save directory and best model path
+
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    save_dir = "saved_models"
+    save_dir      = "saved_models"
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, f"best_unet_{run_timestamp}.pth")
+
+    print_training_config(
+        run_timestamp   = run_timestamp,
+        best_model_path = best_model_path,
+        device          = str(DEVICE),
+        model_name      = "UNet",
+        num_epochs      = NUM_EPOCHS,
+        batch_size      = BATCH_SIZE,
+        learning_rate   = LEARNING_RATE,
+        weight_decay    = WEIGHT_DECAY,
+        step_size       = STEP_SIZE,
+        gamma           = GAMMA,
+        dice_alpha      = DICE_WEIGHT,
+        tv_beta         = TV_WEIGHT,
+        patience        = PATIENCE,
+    )
     
     training_losses = []
     validation_losses = []
@@ -169,7 +179,7 @@ if __name__ == "__main__":
         if epoch_dice_score > best_validation_dice_score:
             best_validation_dice_score = epoch_dice_score
             epochs_without_improvement = 0
-            # torch.save(model.state_dict(), best_model_path)
+            torch.save(model.state_dict(), best_model_path)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= PATIENCE:

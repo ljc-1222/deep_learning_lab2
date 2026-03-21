@@ -1,17 +1,23 @@
 import torch
 from torch import nn
 
-
 class DoubleConv(nn.Module):
-
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size = 3),
-            nn.ReLU(inplace = True),
-            nn.Conv2d(out_channels, out_channels, kernel_size = 3),
-            nn.ReLU(inplace = True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3),
+            nn.ReLU(inplace=True),
         )
+        self._initialize_weights() 
+
+    def _initialize_weights(self):
+        for m in self.block.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode = 'fan_out', nonlinearity = 'relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)

@@ -1,0 +1,8 @@
+# Model weights
+*.pth
+
+# Virtual environment
+dl_lab2_venv/
+
+# Pycache
+__pycache__/

@@ -26,8 +26,7 @@ def tv_loss(pred_logits: torch.Tensor) -> torch.Tensor:
     return diff_h.mean() + diff_w.mean()
 
 
-def combined_loss(
-    pred_logits: torch.Tensor, target: torch.Tensor, alpha: float = 1.0, beta: float  = 0.1) -> torch.Tensor:
+def combined_loss(pred_logits: torch.Tensor, target: torch.Tensor, alpha: float = 1.0, beta: float  = 0.1) -> torch.Tensor:
 
     ce   = F.cross_entropy(pred_logits, target)
     dice = dice_loss(pred_logits, target)

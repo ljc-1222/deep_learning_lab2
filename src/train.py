@@ -7,8 +7,9 @@ import torchvision.transforms.functional as F
 from tqdm import tqdm
 from src.models.unet import UNet
 from torch.utils.data import DataLoader
-from src.utils import print_training_config
+from src.oxford_pet import OxfordPetDataset
 from src.evaluate import dice_score, combined_loss
+from src.utils import print_training_config, plot_training_curves
 
 # Device and number of workers
 NUM_WORKERS = min(4, os.cpu_count())
@@ -23,17 +24,13 @@ BATCH_SIZE = 24
 # Training hyperparameters
 NUM_EPOCHS  = 250
 DICE_WEIGHT = 1.3 
-TV_WEIGHT   = 0.4
+TV_WEIGHT   = 0.1
 
 # Optimizer hyperparameters
 WEIGHT_DECAY = 1e-5
 LEARNING_RATE = 1e-3
 
 # Scheduler hyperparameters
-GAMMA = 0.1
-STEP_SIZE = 10
-
-# Early stopping hyperparameters
 PATIENCE = 40
 FACTOR = 0.5
 
@@ -70,31 +67,28 @@ optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE, weight_dec
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'max', factor = FACTOR, patience = PATIENCE)
 
-def train_one_epoch(model, optimizer, scheduler, loss, train_dataloader):
-    
-    training_loss = 0
+def train_one_epoch(model, optimizer, loss, train_dataloader) -> float:
+
+    training_loss = 0.0
     model.train()
-    train_pbar = tqdm(train_dataloader, desc = "Training  ")
-    
-    for batch_idx, (image, trimap, _) in enumerate(train_pbar):
-        
-        image = image.to(DEVICE)
+    train_pbar = tqdm(train_dataloader, desc="Training  ")
+
+    for image, trimap, _ in train_pbar:
+
+        image  = image.to(DEVICE)
         trimap = trimap.to(DEVICE)
 
-        output = model(image)
+        output     = model(image)
         loss_value = loss(output, trimap)
 
         training_loss += loss_value.item()
-        train_pbar.set_postfix({'loss': f"{loss_value.item():.4f}"})
         optimizer.zero_grad(set_to_none=True)
         loss_value.backward()
         optimizer.step()
-        
-    scheduler.step(epoch_dice_score)
-        
-    training_loss = training_loss / len(train_dataloader)
-        
-    return training_loss
+
+        train_pbar.set_postfix({'loss': f"{loss_value.item():.4f}"})
+
+    return training_loss / len(train_dataloader)
         
 def validate_one_epoch(model, loss, val_dataloader):
     
@@ -135,9 +129,9 @@ def validate_one_epoch(model, loss, val_dataloader):
 if __name__ == "__main__":
 
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    save_dir      = "saved_models"
-    os.makedirs(save_dir, exist_ok=True)
-    best_model_path = os.path.join(save_dir, f"best_unet_{run_timestamp}.pth")
+    save_dir      = os.path.join("saved_models", "unet", run_timestamp)
+    os.makedirs(save_dir, exist_ok = True)
+    best_model_path = os.path.join(save_dir, f"unet.pth")
 
     print_training_config(
         run_timestamp   = run_timestamp,
@@ -148,40 +142,50 @@ if __name__ == "__main__":
         batch_size      = BATCH_SIZE,
         learning_rate   = LEARNING_RATE,
         weight_decay    = WEIGHT_DECAY,
-        step_size       = STEP_SIZE,
-        gamma           = GAMMA,
         dice_alpha      = DICE_WEIGHT,
         tv_beta         = TV_WEIGHT,
         patience        = PATIENCE,
+        factor          = FACTOR,
     )
     
-    training_losses = []
-    validation_losses = []
-    dice_scores = []
-    
+    train_losses:   list[float] = []
+    val_losses:     list[float] = []
+    val_dice_scores: list[float] = []
+
     best_validation_dice_score = -1.0
     epochs_without_improvement = 0
-    
-    for epoch in tqdm(range(NUM_EPOCHS)):
-        
-        # Training
-        training_loss = train_one_epoch(model, optimizer, scheduler, loss, train_dataloader)
 
-        # Validation
-        validation_loss, epoch_dice_score = validate_one_epoch(model, loss, val_dataloader)
-                
-        training_losses.append(training_loss)
-        validation_losses.append(validation_loss)
-        dice_scores.append(epoch_dice_score)
-        
-        tqdm.write(f"Epoch {epoch+1:3d} | Train Loss: {training_loss:.4f} | Val Loss: {validation_loss:.4f} | Val Dice: {epoch_dice_score:.4f}")
-                
-        if epoch_dice_score > best_validation_dice_score:
-            best_validation_dice_score = epoch_dice_score
-            epochs_without_improvement = 0
-            torch.save(model.state_dict(), best_model_path)
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= PATIENCE:
-                tqdm.write(f"Early stopping at epoch {epoch+1}. Best validation dice score: {best_validation_dice_score:.4f}")
-                break
+    try:
+        for epoch in tqdm(range(NUM_EPOCHS)):
+
+            training_loss = train_one_epoch(model, optimizer, loss, train_dataloader)
+            validation_loss, epoch_dice_score = validate_one_epoch(model, loss, val_dataloader)
+
+            scheduler.step(epoch_dice_score)
+
+            train_losses.append(training_loss)
+            val_losses.append(validation_loss)
+            val_dice_scores.append(
+                epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score)
+            )
+
+            tqdm.write(f"Epoch {epoch+1:3d} | Train Loss: {training_loss:.4f} | Val Loss: {validation_loss:.4f} | Val Dice: {epoch_dice_score:.4f}")
+
+            if epoch_dice_score > best_validation_dice_score:
+                best_validation_dice_score = epoch_dice_score
+                epochs_without_improvement = 0
+                torch.save(model.state_dict(), best_model_path)
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= PATIENCE:
+                    tqdm.write(f"Early stopping at epoch {epoch+1}. Best Dice: {best_validation_dice_score:.4f}")
+                    break
+
+    finally:
+        if train_losses:
+            plot_training_curves(
+                train_losses    = train_losses,
+                val_losses      = val_losses,
+                val_dice_scores = val_dice_scores,
+                save_dir        = save_dir,
+            )

@@ -1,8 +1,11 @@
 # Model weights
-*.pth
+saved_models/
 
 # Virtual environment
 dl_lab2_venv/
 
 # Pycache
 __pycache__/
+
+# Cursor
+.cursor/

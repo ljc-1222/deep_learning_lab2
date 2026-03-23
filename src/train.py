@@ -1,40 +1,69 @@
 import os
 import time
-import torch
+import warnings
+
 import numpy as np
-import torchvision.transforms.functional as F
+import torch
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from src.models.unet import UNet
+from src.models.resnet34_unet import ResNet34UNet
 from torch.utils.data import DataLoader
 from src.oxford_pet import OxfordPetDataset
-from src.evaluate import dice_score, combined_loss
-from src.utils import print_training_config, plot_training_curves
+from src.evaluate import dice_score, combined_loss, combined_loss_lovasz
+from src.utils import (
+    prepare_five_crops,
+    stitch_five_crop_results,
+    print_training_config,
+    plot_training_curves,
+)
 
-# Device and number of workers
-NUM_WORKERS = min(4, os.cpu_count())
+# Number of workers
+NUM_WORKERS = 6
+
+# Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# PyTorch SequentialLR internally passes `epoch` to sub-scheduler.step(),
+# which triggers a deprecation UserWarning that is not actionable from user code.
+warnings.filterwarnings(
+    "ignore",
+    message = "The epoch parameter in `scheduler.step\\(\\)`",
+    category = UserWarning,
+    module = "torch.optim.lr_scheduler",
+)
 
 # Seed
 SEED = 42
 
-# Dataset hyperparameters
-BATCH_SIZE = 24
+# Model selection
+MODEL_NAME = "UNet"
 
 # Training hyperparameters
-NUM_EPOCHS  = 250
-DICE_WEIGHT = 1.3 
-TV_WEIGHT   = 0.1
+BATCH_SIZE        = 16
+P1_EPOCHS         = 50
+P2_EPOCHS         = 100
+DICE_WEIGHT       = 2.0
+LOVASZ_WEIGHT     = 0.8
+P2_LR_DIVISOR     = 10
+FOCAL_GAMMA       = 0.0
 
 # Optimizer hyperparameters
-WEIGHT_DECAY = 1e-5
-LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-3
+LEARNING_RATE = 2e-4
 
 # Scheduler hyperparameters
-PATIENCE = 40
-FACTOR = 0.5
+P1_WARMUP_EPOCHS      = 5
+P2_WARMUP_EPOCHS      = 3
+P1_WARMUP_START_FACTOR = 0.01
+P2_WARMUP_START_FACTOR = 0.05
+COSINE_ETA_MIN_FACTOR  = 0.01
 
-# Set seed
+# Early stopping hyperparameters
+P1_PATIENCE = 5
+P2_PATIENCE = 12
+
 torch.manual_seed(SEED)
 
 train_dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet", 
@@ -45,29 +74,16 @@ val_dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet",
                                split_file = "val.txt", 
                                is_train = False)
 
-train_dataloader = DataLoader(train_dataset, 
-                                   batch_size = BATCH_SIZE, 
-                                   shuffle = True, 
-                                   num_workers = NUM_WORKERS,
-                                   pin_memory = True,
-                                   persistent_workers = True)
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size = BATCH_SIZE,
+    shuffle = True,
+    num_workers = NUM_WORKERS,
+    pin_memory = True,
+    persistent_workers = True,
+)
 
-val_dataloader = DataLoader(val_dataset, 
-                                 batch_size = BATCH_SIZE, 
-                                 shuffle = False, 
-                                 num_workers = NUM_WORKERS,
-                                 pin_memory = True,
-                                 persistent_workers = True)
-
-model  = torch.compile(UNet().to(DEVICE))
-
-loss = lambda output, target: combined_loss(output, target, alpha = DICE_WEIGHT, beta = TV_WEIGHT)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE, weight_decay = WEIGHT_DECAY)
-
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'max', factor = FACTOR, patience = PATIENCE)
-
-def train_one_epoch(model, optimizer, loss, train_dataloader) -> float:
+def train_one_epoch(model, optimizer, loss, train_dataloader, scheduler = None) -> float:
 
     training_loss = 0.0
     model.train()
@@ -86,102 +102,228 @@ def train_one_epoch(model, optimizer, loss, train_dataloader) -> float:
         loss_value.backward()
         optimizer.step()
 
-        train_pbar.set_postfix({'loss': f"{loss_value.item():.4f}"})
+        if scheduler is not None:
+            scheduler.step()
+
+        train_pbar.set_postfix({'loss': f"{loss_value.item():.6f}"})
 
     return training_loss / len(train_dataloader)
         
-def validate_one_epoch(model, loss, val_dataloader):
+def validate_one_epoch(model, val_dataset):
     
     model.eval()
-    
+    validation_loss  = 0.0
+    epoch_dice_score = 0.0
+
     with torch.no_grad():
-    
-        validation_loss = 0
-        epoch_dice_score = 0
-        val_pbar = tqdm(val_dataloader, desc = "Validation")
-    
-        for image, trimap, idxs in val_pbar:
-            
-            image = image.to(DEVICE)
-            trimap = trimap.to(DEVICE)
-            output = model(image)
-            loss_value = loss(output, trimap)
+        val_pbar = tqdm(range(len(val_dataset)), desc="Validation")
+        for idx in val_pbar:
+            pil_image = val_dataset.load_image(idx).convert("RGB")
+
+            batch, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig = prepare_five_crops(pil_image)
+            batch = batch.to(DEVICE)
+
+            probs = torch.softmax(model(batch), dim = 1).cpu()
+
+            stitched = stitch_five_crop_results(probs, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)
+
+            trimap_np = (np.array(val_dataset.load_trimap(idx)) == 1).astype(np.uint8)
+            trimap_t = torch.from_numpy(trimap_np).long()
+
+            log_probs = torch.log(stitched.clamp(min = 1e-8))
+            loss_value = F.nll_loss(log_probs.unsqueeze(0), trimap_t.unsqueeze(0))
             validation_loss += loss_value.item()
-            
-            for i in range(len(idxs)):
-                idx = idxs[i]
-                size_i = val_dataset.load_image(idx).size[::-1]
-                output_i = F.resize(output[i], size = size_i).squeeze(0)
-                output_i = torch.argmax(output_i, dim = 0).float()
-                trimap_i = val_dataset.load_trimap(idx)
-                trimap_i = np.array(trimap_i)
-                trimap_i = (trimap_i == 1).astype(np.uint8)
-                trimap_i = torch.from_numpy(trimap_i).float().to(DEVICE)
-                epoch_dice_score += dice_score(output_i, trimap_i)
-                
-            val_pbar.set_postfix({'loss': f"{loss_value.item():.4f}"})
-        
-    validation_loss = validation_loss / len(val_dataloader)
-    epoch_dice_score = epoch_dice_score / len(val_dataset)
-    
-    return validation_loss, epoch_dice_score
+
+            pred = torch.argmax(stitched, dim = 0).float()
+            epoch_dice_score += dice_score(pred, trimap_t.float())
+
+            val_pbar.set_postfix({"loss": f"{loss_value.item():.6f}"})
+
+    return validation_loss / len(val_dataset), epoch_dice_score / len(val_dataset)
 
 if __name__ == "__main__":
+    
+    if MODEL_NAME == "UNet":
+        model  = torch.compile(UNet().to(DEVICE))
+    elif MODEL_NAME == "ResNet34_UNet":
+        model  = torch.compile(ResNet34UNet().to(DEVICE))
 
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    save_dir      = os.path.join("saved_models", "unet", run_timestamp)
+    save_dir      = os.path.join("saved_models", MODEL_NAME, run_timestamp)
     os.makedirs(save_dir, exist_ok = True)
-    best_model_path = os.path.join(save_dir, f"unet.pth")
+    p1_best_model_path = os.path.join(save_dir, f"{MODEL_NAME}_p1.pth")
+    p2_best_model_path = os.path.join(save_dir, f"{MODEL_NAME}_p2.pth")
 
     print_training_config(
-        run_timestamp   = run_timestamp,
-        best_model_path = best_model_path,
-        device          = str(DEVICE),
-        model_name      = "UNet",
-        num_epochs      = NUM_EPOCHS,
-        batch_size      = BATCH_SIZE,
-        learning_rate   = LEARNING_RATE,
-        weight_decay    = WEIGHT_DECAY,
-        dice_alpha      = DICE_WEIGHT,
-        tv_beta         = TV_WEIGHT,
-        patience        = PATIENCE,
-        factor          = FACTOR,
+        run_timestamp            = run_timestamp,
+        p1_best_model_path       = p1_best_model_path,
+        p2_best_model_path       = p2_best_model_path,
+        device                   = str(DEVICE),
+        model_name               = MODEL_NAME,
+        phase1_epochs            = P1_EPOCHS,
+        phase2_epochs            = P2_EPOCHS,
+        batch_size               = BATCH_SIZE,
+        learning_rate            = LEARNING_RATE,
+        weight_decay             = WEIGHT_DECAY,
+        dice_alpha               = DICE_WEIGHT,
+        lovasz_beta              = LOVASZ_WEIGHT,
+        p1_warmup_epochs         = P1_WARMUP_EPOCHS,
+        p2_warmup_epochs         = P2_WARMUP_EPOCHS,
+        p1_warmup_start_factor   = P1_WARMUP_START_FACTOR,
+        p2_warmup_start_factor   = P2_WARMUP_START_FACTOR,
+        p1_cosine_eta_min_factor = COSINE_ETA_MIN_FACTOR,
+        p2_cosine_eta_min_factor = COSINE_ETA_MIN_FACTOR,
+        patience_phase1          = P1_PATIENCE,
+        p2_lr_divisor            = P2_LR_DIVISOR,
+        patience_phase2          = P2_PATIENCE,
     )
-    
-    train_losses:   list[float] = []
-    val_losses:     list[float] = []
+
+    train_losses:    list[float] = []
+    val_losses:      list[float] = []
     val_dice_scores: list[float] = []
 
-    best_validation_dice_score = -1.0
-    epochs_without_improvement = 0
-
     try:
-        for epoch in tqdm(range(NUM_EPOCHS)):
+        # ── Phase 1: Focal + Dice, linear warmup then constant LR ────────────
+        tqdm.write(f"\n── Phase 1: Focal(gamma = {FOCAL_GAMMA}) + Dice ({P1_EPOCHS} epochs, warmup {P1_WARMUP_EPOCHS} ep) ──")
 
-            training_loss = train_one_epoch(model, optimizer, loss, train_dataloader)
-            validation_loss, epoch_dice_score = validate_one_epoch(model, loss, val_dataloader)
+        steps_per_epoch = len(train_dataloader)
 
-            scheduler.step(epoch_dice_score)
+        # Training settings
+        p1_lr = LEARNING_RATE
+        p1_loss = lambda output, target: combined_loss(output, target, alpha = DICE_WEIGHT, gamma = FOCAL_GAMMA)    
+        p1_optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr           = p1_lr, 
+            weight_decay = WEIGHT_DECAY,
+        )
+        
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            p1_optimizer,
+            start_factor = P1_WARMUP_START_FACTOR,
+            end_factor   = 1.0,
+            total_iters  = P1_WARMUP_EPOCHS * steps_per_epoch,
+        )
+        
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            p1_optimizer,
+            T_max   = (P1_EPOCHS - P1_WARMUP_EPOCHS) * steps_per_epoch,
+            eta_min = 1e-6, 
+        )
+        
+        p1_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            p1_optimizer,
+            schedulers = [warmup_scheduler, cosine_scheduler],
+            milestones = [P1_WARMUP_EPOCHS * steps_per_epoch]
+        )
+
+        best_p1_dice = -1.0
+        p1_epochs_no_improve = 0
+
+        # Training loop
+        for epoch in tqdm(range(P1_EPOCHS), desc = "Phase 1"):
+
+            training_loss = train_one_epoch(model, p1_optimizer, p1_loss, train_dataloader,
+                                            scheduler=p1_scheduler)
+            validation_loss, epoch_dice_score = validate_one_epoch(model, val_dataset)
 
             train_losses.append(training_loss)
             val_losses.append(validation_loss)
-            val_dice_scores.append(
-                epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score)
+            val_dice_scores.append(epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score))
+
+            tqdm.write(
+                f"[P1] Epoch {epoch+1:2d}/{P1_EPOCHS} | "
+                f"Train Loss: {training_loss:.6f} | "
+                f"Val Loss: {validation_loss:.6f} | "
+                f"Val Dice: {epoch_dice_score:.6f}"
             )
 
-            tqdm.write(f"Epoch {epoch+1:3d} | Train Loss: {training_loss:.4f} | Val Loss: {validation_loss:.4f} | Val Dice: {epoch_dice_score:.4f}")
 
-            if epoch_dice_score > best_validation_dice_score:
-                best_validation_dice_score = epoch_dice_score
-                epochs_without_improvement = 0
-                torch.save(model.state_dict(), best_model_path)
+            # Early stopping & checkpoint saving
+            if epoch_dice_score > best_p1_dice:
+                best_p1_dice         = epoch_dice_score
+                p1_epochs_no_improve = 0
+                torch.save(model.state_dict(), p1_best_model_path)
+                tqdm.write(f"  ↑ New best Dice: {best_p1_dice:.6f} — checkpoint saved")
             else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= PATIENCE:
-                    tqdm.write(f"Early stopping at epoch {epoch+1}. Best Dice: {best_validation_dice_score:.4f}")
+                p1_epochs_no_improve += 1
+                if p1_epochs_no_improve >= P1_PATIENCE:
+                    tqdm.write(
+                        f"Early stopping at P1 epoch {epoch+1}. Best Dice: {best_p1_dice:.6f}"
+                    )
+                    break
+
+        tqdm.write(f"Phase 1 complete. Best Dice: {best_p1_dice:.6f}")
+
+        model.load_state_dict(torch.load(p1_best_model_path, weights_only=True))
+        tqdm.write(f"Loaded best Phase 1 weights → {p1_best_model_path}")
+
+        # ── Phase 2: Focal + Lovász, LR/10, CosineAnnealing, early stopping ───
+        tqdm.write(f"\n── Phase 2: Focal(gamma = {FOCAL_GAMMA}) + Lovász (max {P2_EPOCHS} epochs, CosineAnnealingLR) ──")
+
+        p2_lr = LEARNING_RATE / P2_LR_DIVISOR
+        p2_loss = lambda output, target: combined_loss_lovasz(output, target, beta = LOVASZ_WEIGHT, gamma = FOCAL_GAMMA)
+        p2_optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr           = p2_lr,
+            weight_decay = WEIGHT_DECAY / 20,
+        )
+        p2_warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            p2_optimizer,
+            start_factor = P2_WARMUP_START_FACTOR,
+            end_factor   = 1.0,
+            total_iters  = P2_WARMUP_EPOCHS * steps_per_epoch,
+        )
+
+        p2_cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            p2_optimizer,
+            T_max   = (P2_EPOCHS - P2_WARMUP_EPOCHS) * steps_per_epoch,
+            eta_min = p2_lr * COSINE_ETA_MIN_FACTOR,
+        )
+        
+        p2_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            p2_optimizer,
+            schedulers = [p2_warmup_scheduler, p2_cosine_scheduler],
+            milestones = [P2_WARMUP_EPOCHS * steps_per_epoch]
+        )
+
+        best_p2_dice = -1.0
+        epochs_without_improve = 0
+
+        # Training loop
+        for epoch in tqdm(range(P2_EPOCHS), desc = "Phase 2"):
+
+            training_loss = train_one_epoch(model, p2_optimizer, p2_loss, train_dataloader,
+                                            scheduler=p2_scheduler)
+            validation_loss, epoch_dice_score = validate_one_epoch(model, val_dataset)
+
+            train_losses.append(training_loss)
+            val_losses.append(validation_loss)
+            val_dice_scores.append(epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score))
+
+            tqdm.write(
+                f"[P2] Epoch {epoch+1:2d}/{P2_EPOCHS} | "
+                f"Train Loss: {training_loss:.6f} | "
+                f"Val Loss: {validation_loss:.6f} | "
+                f"Val Dice: {epoch_dice_score:.6f}"
+            )
+            
+            # Early stopping & checkpoint saving
+            if epoch_dice_score > best_p2_dice:
+                best_p2_dice           = epoch_dice_score
+                epochs_without_improve = 0
+                torch.save(model.state_dict(), p2_best_model_path)
+                tqdm.write(f"  ↑ New best Dice: {best_p2_dice:.6f} — checkpoint saved")
+            else:
+                epochs_without_improve += 1
+                if epochs_without_improve >= P2_PATIENCE:
+                    tqdm.write(
+                        f"Early stopping at P2 epoch {epoch+1}. "
+                        f"Best Dice: {best_p2_dice:.6f}"
+                    )
                     break
 
     finally:
+        # Plot training curves
         if train_losses:
             plot_training_curves(
                 train_losses    = train_losses,

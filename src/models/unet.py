@@ -29,7 +29,7 @@ class UNet(nn.Module):
         super().__init__()
 
         # ── Encoder ───────────────────────────────────────────────────────────
-        self.enc1 = DoubleConv(1, 64)
+        self.enc1 = DoubleConv(3, 64)
         self.enc2 = DoubleConv(64, 128)
         self.enc3 = DoubleConv(128, 256)
         self.enc4 = DoubleConv(256, 512)
@@ -82,4 +82,4 @@ if __name__ == "__main__":
     import torchinfo
 
     model = UNet()
-    torchinfo.summary(model, input_size=(1, 1, 528, 528))
+    torchinfo.summary(model, input_size=(1, 3, 528, 528))

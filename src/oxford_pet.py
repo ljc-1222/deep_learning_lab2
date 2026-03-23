@@ -39,17 +39,13 @@ class OxfordPetDataset(Dataset):
         trimap = F.resize(trimap, size = target_size, interpolation =F.InterpolationMode.NEAREST) # (target_size)
 
         if self.is_train:
-            jitter = transforms.ColorJitter(brightness = 0.2, contrast = 0.2, saturation = 0.2, hue = 0.1)
+            jitter = transforms.ColorJitter(brightness = 0.2, contrast = 0.2, saturation = 0.2, hue = 0.05)
             image = jitter(image)
 
             if torch.rand(1).item() < 0.5:
                 image = F.hflip(image)
                 trimap = F.hflip(trimap)
-
-        if self.transform is not None:
-            image = self.transform(image)
             
-        image = F.rgb_to_grayscale(image)
         image = F.to_tensor(image)
         image = F.pad(image, padding = 92, fill = 0, padding_mode = "reflect")
 
@@ -58,10 +54,6 @@ class OxfordPetDataset(Dataset):
         trimap = torch.from_numpy(trimap).long()
         
         return image, trimap, idx
-
-
-train_transforms = transforms.Compose([])
-val_transforms = transforms.Compose([])
     
 if __name__ == "__main__":
     

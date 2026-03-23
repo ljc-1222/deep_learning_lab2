@@ -6,3 +6,4 @@ dl_lab2_venv/
 
 # Pycache
 __pycache__/
+*.pyc

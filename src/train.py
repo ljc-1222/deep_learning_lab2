@@ -11,6 +11,7 @@ from src.oxford_pet import OxfordPetDataset
 from src.evaluate import dice_score, combined_loss
 from src.utils import print_training_config, plot_training_curves
 
+
 # Device and number of workers
 NUM_WORKERS = min(4, os.cpu_count())
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -19,20 +20,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 
 # Dataset hyperparameters
-BATCH_SIZE = 24
+BATCH_SIZE = 4
 
 # Training hyperparameters
-NUM_EPOCHS  = 250
-DICE_WEIGHT = 1.3 
+NUM_EPOCHS  = 50
+DICE_WEIGHT = 1.8 
 TV_WEIGHT   = 0.1
 
 # Optimizer hyperparameters
-WEIGHT_DECAY = 1e-5
-LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 5e-4
+LEARNING_RATE = 5e-4
 
-# Scheduler hyperparameters
-PATIENCE = 40
-FACTOR = 0.5
+# Early stopping hyperparameters
+PATIENCE = 12
 
 # Set seed
 torch.manual_seed(SEED)
@@ -59,19 +59,27 @@ val_dataloader = DataLoader(val_dataset,
                                  pin_memory = True,
                                  persistent_workers = True)
 
+# Scheduler hyperparameters
+WARMUP_EPOCHS     = 5
+WARMUP_ITERATIONS = WARMUP_EPOCHS * len(train_dataloader)
+WARMUP_FACTOR     = 0.01
+
 model  = torch.compile(UNet().to(DEVICE))
 
 loss = lambda output, target: combined_loss(output, target, alpha = DICE_WEIGHT, beta = TV_WEIGHT)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE, weight_decay = WEIGHT_DECAY)
 
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'max', factor = FACTOR, patience = PATIENCE)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor = WARMUP_FACTOR, end_factor = 1.0, total_iters = WARMUP_EPOCHS)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = NUM_EPOCHS - WARMUP_EPOCHS)
+scheduler = torch.optim.lr_scheduler.ChainedScheduler([warmup_scheduler, cosine_scheduler])
+
 
 def train_one_epoch(model, optimizer, loss, train_dataloader) -> float:
 
     training_loss = 0.0
     model.train()
-    train_pbar = tqdm(train_dataloader, desc="Training  ")
+    train_pbar = tqdm(train_dataloader, desc = "Training  ")
 
     for image, trimap, _ in train_pbar:
 
@@ -145,7 +153,8 @@ if __name__ == "__main__":
         dice_alpha      = DICE_WEIGHT,
         tv_beta         = TV_WEIGHT,
         patience        = PATIENCE,
-        factor          = FACTOR,
+        warmup_epochs   = WARMUP_EPOCHS,
+        warmup_factor   = WARMUP_FACTOR,
     )
     
     train_losses:   list[float] = []

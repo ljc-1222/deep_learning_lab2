@@ -16,7 +16,8 @@ def print_training_config(
     dice_alpha: float,
     tv_beta: float,
     patience: int,
-    factor: float,
+    warmup_epochs: int,
+    warmup_factor: float,
     width: int = 60,
 ) -> None:
     
@@ -37,11 +38,11 @@ def print_training_config(
     tqdm.write(row("Batch Size",          batch_size))
     tqdm.write(row("Learning Rate",       learning_rate))
     tqdm.write(row("Weight Decay",        weight_decay))
-    tqdm.write(row("LR Factor",            factor))
-    tqdm.write(row("LR Patience",          patience))
+    tqdm.write(row("Warmup Epochs",       warmup_epochs))
+    tqdm.write(row("Warmup Factor",       warmup_factor))
+    tqdm.write(row("Early Stop Patience", patience))
     tqdm.write("╠" + "─" * W + "╣")
     tqdm.write(row("Loss",                f"CE + {dice_alpha}×Dice + {tv_beta}×TV"))
-    tqdm.write(row("Early Stop Patience", patience))
     tqdm.write(row("Checkpoint",          os.path.basename(best_model_path)))
     tqdm.write("╚" + "═" * W + "╝")
     tqdm.write("")
@@ -55,17 +56,17 @@ def plot_training_curves(
 ) -> None:
     epochs = list(range(1, len(train_losses) + 1))
 
-    fig1, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(epochs, train_losses, color="steelblue", linewidth=1.5, label="Train Loss")
-    ax1.plot(epochs, val_losses,   color="tomato",    linewidth=1.5, label="Val Loss")
+    fig1, ax1 = plt.subplots(figsize = (8, 5))
+    ax1.plot(epochs, train_losses, color = "steelblue", linewidth=1.5, label = "Train Loss")
+    ax1.plot(epochs, val_losses,   color = "tomato",    linewidth=1.5, label = "Val Loss")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
     ax1.set_title("Training & Validation Loss")
     ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    ax1.grid(True, alpha = 0.3)
     fig1.tight_layout()
     loss_path = os.path.join(save_dir, "loss_curves.png")
-    fig1.savefig(loss_path, dpi=150)
+    fig1.savefig(loss_path, dpi = 150)
     print(f"Saved → {loss_path}")
 
     fig2, ax2 = plt.subplots(figsize=(8, 5))
@@ -73,10 +74,10 @@ def plot_training_curves(
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Dice Score")
     ax2.set_title("Validation Dice Score")
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, alpha = 0.3)
     fig2.tight_layout()
     dice_path = os.path.join(save_dir, "dice_scores.png")
-    fig2.savefig(dice_path, dpi=150)
+    fig2.savefig(dice_path, dpi = 150)
     print(f"Saved → {dice_path}")
 
     plt.show()

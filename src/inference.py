@@ -4,16 +4,17 @@ import torch
 import numpy as np
 import torchvision.transforms.functional as TF
 
+from PIL import Image
 from tqdm import tqdm
 from scipy import ndimage
 from skimage import morphology
 
 from src.models.unet import UNet
 from src.evaluate import dice_score
-from src.oxford_pet import OxfordPetDataset
-from src.utils import prepare_five_crops, rle_encode, stitch_five_crop_results
+from src.oxford_pet import OxfordPetDataset, IMAGENET_MEAN, IMAGENET_STD
+from src.utils import prepare_five_crops, predict_full_image, rle_encode, stitch_five_crop_results
 
-TIMESTAMP      = "20260323-040637"
+TIMESTAMP      = "20260323-064056"
 BATCH_SIZE     = 16
 DATASET_ROOT   = "dataset/oxford-iiit-pet"
 VAL_SPLIT      = "val.txt"
@@ -24,6 +25,7 @@ THRESHOLD_STEP = 0.05
 
 NUM_WORKERS = 6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 
 def load_model(model_path: str, device: torch.device) -> UNet:
@@ -72,7 +74,7 @@ def tta_predict(model: UNet, image_batch: torch.Tensor) -> torch.Tensor:
         Averaged softmax probability tensor.
     """
     def fwd(x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(model(x), dim=1)
+        return torch.softmax(model(x), dim = 1)
 
     probs = []
     for jf in _TTA_JITTER:
@@ -80,7 +82,8 @@ def tta_predict(model: UNet, image_batch: torch.Tensor) -> torch.Tensor:
         probs.append(fwd(img))
         probs.append(TF.hflip(fwd(TF.hflip(img))))
 
-    return torch.stack(probs).mean(dim=0)
+    return torch.stack(probs).mean(dim = 0)
+
 
 
 def collect_probs(
@@ -89,6 +92,13 @@ def collect_probs(
     desc: str = "Collecting probs",
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
     """Run TTA inference over a dataset and collect per-image fg probabilities.
+
+    For each image, two predictions are averaged 1:1:
+
+    * **Five-crop** — five overlapping 388×388 crops stitched back to the
+      original resolution via :func:`~src.utils.stitch_five_crop_results`.
+    * **Full-image** — the whole image resized to 388×388, fed through the
+      model, then upsampled back to the original resolution.
 
     Args:
         model: Trained UNet model.
@@ -101,14 +111,29 @@ def collect_probs(
     all_probs, all_targets, all_idxs = [], [], []
 
     for idx in tqdm(range(len(dataset)), desc=desc):
-        pil_image = dataset.load_image(idx).convert("RGB")
-        batch, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig = prepare_five_crops(pil_image)
+        # dataset[idx] applies to_tensor + ImageNet normalize (is_train=False path)
+        img_normalized, trimap_t, _ = dataset[idx]
+        H_orig, W_orig = img_normalized.shape[1], img_normalized.shape[2]
 
-        probs = tta_predict(model, batch.to(DEVICE)).cpu()
-        stitched = stitch_five_crop_results(probs, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)
+        # Five-crop path: build crops from raw PIL, then normalize the batch
+        pil_image = dataset.load_image(idx).convert("RGB")
+        batch, positions, H_p, W_p, pad_top, pad_left, _, _ = prepare_five_crops(pil_image)
+        batch = TF.normalize(batch, mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+        five_crop_probs = tta_predict(model, batch.to(DEVICE)).cpu()
+        stitched = stitch_five_crop_results(five_crop_probs, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)
+
+        # Full-image path: reuse the already-normalised tensor from dataset[idx]
+        full_probs = predict_full_image(
+            lambda b: tta_predict(model, b.to(DEVICE)),
+            img_normalized,
+        )
+
+        # 1:1 weighted average of five-crop and full-image predictions
+        combined = (stitched + full_probs) * 0.5
 
         trimap_np = np.array(dataset.load_trimap(idx))
-        all_probs.append(stitched[1].numpy().astype(np.float32))
+        all_probs.append(combined[1].numpy().astype(np.float32))
         all_targets.append((trimap_np == 1).astype(np.uint8))
         all_idxs.append(idx)
 
@@ -146,7 +171,7 @@ def find_optimal_threshold(
 
 def _apply_postprocess(mask: np.ndarray) -> np.ndarray:
     """Remove small objects and fill holes in a binary mask."""
-    mask = morphology.remove_small_objects(mask, min_size = 500)
+    mask = morphology.remove_small_objects(mask, max_size = 499)
     mask = ndimage.binary_fill_holes(mask).astype(np.uint8)
     return mask
 
@@ -228,8 +253,8 @@ def generate_submission(
     ]
 
     csv_path = os.path.join(save_dir, "submission.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["image_id", "encoded_mask"])
+    with open(csv_path, "w", newline = "") as f:
+        writer = csv.DictWriter(f, fieldnames = ["image_id", "encoded_mask"])
         writer.writeheader()
         writer.writerows(rows)
 

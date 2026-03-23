@@ -11,53 +11,31 @@ from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Dataset
 
-TARGET_SIZE: Tuple[int, int] = (388, 388)  # 572 = 388 + 92*2 (UNet padded input)
+TARGET_SIZE:    Tuple[int, int] = (388, 388)
+IMAGENET_MEAN: list[float]     = [0.485, 0.456, 0.406]
+IMAGENET_STD:  list[float]     = [0.229, 0.224, 0.225]
 
-GAMMA_MIN: float = 0.8
-GAMMA_MAX: float = 1.2
-
-
-def _pad_to_min_hw(
+def _random_resized_crop_pair(
     image: Image.Image,
     trimap: Image.Image,
-    min_h: int,
-    min_w: int,
+    target_size: Tuple[int, int],
+    scale: Tuple[float, float] = (0.2, 1.0),
+    ratio: Tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0),
 ) -> Tuple[Image.Image, Image.Image]:
-    """Pad image (reflect) and trimap (constant 0) so both are at least min_h × min_w."""
-    w, h = image.size
-    pad_left = pad_top = pad_right = pad_bottom = 0
-    if w < min_w:
-        diff = min_w - w
-        pad_left = diff // 2
-        pad_right = diff - pad_left
-    if h < min_h:
-        diff = min_h - h
-        pad_top = diff // 2
-        pad_bottom = diff - pad_top
-    if pad_left or pad_top or pad_right or pad_bottom:
-        padding = (pad_left, pad_top, pad_right, pad_bottom)
-        image = F.pad(image, padding, fill=0, padding_mode="reflect")
-        trimap = F.pad(trimap, padding, fill=0, padding_mode="constant")
-    return image, trimap
+    """Apply the same random resized crop to RGB image and trimap."""
+    i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=scale, ratio=ratio)
 
+    image = F.crop(image, i, j, h, w)
+    trimap = F.crop(trimap, i, j, h, w)
 
-def _random_crop_pair(
-    image: Image.Image,
-    trimap: Image.Image,
-    crop_h: int,
-    crop_w: int,
-) -> Tuple[Image.Image, Image.Image]:
-    """Apply the same spatial crop to RGB image and trimap."""
-    w, h = image.size
-    top = int(torch.randint(0, h - crop_h + 1, (1,)).item())
-    left = int(torch.randint(0, w - crop_w + 1, (1,)).item())
-    image = F.crop(image, top, left, crop_h, crop_w)
-    trimap = F.crop(trimap, top, left, crop_h, crop_w)
+    image = F.resize(image, target_size, interpolation=F.InterpolationMode.BILINEAR)
+    trimap = F.resize(trimap, target_size, interpolation=F.InterpolationMode.NEAREST)
+
     return image, trimap
 
 
 class OxfordPetDataset(Dataset):
-    def __init__(self, root, split_file, transform = None, is_train = False):
+    def __init__(self, root, split_file, transform=None, is_train=False):
         self.root = Path(root)
         self.split_file = self.root / split_file
         self.is_train = is_train
@@ -82,24 +60,21 @@ class OxfordPetDataset(Dataset):
         image = self.load_image(idx).convert("RGB")
         trimap = self.load_trimap(idx)
 
-        crop_h, crop_w = TARGET_SIZE
         if self.is_train:
-            image, trimap = _pad_to_min_hw(image, trimap, crop_h, crop_w)
-            image, trimap = _random_crop_pair(image, trimap, crop_h, crop_w)
+            image, trimap = _random_resized_crop_pair(image, trimap, TARGET_SIZE)
 
             if torch.rand(1).item() < 0.5:
                 image = F.hflip(image)
                 trimap = F.hflip(trimap)
 
             if torch.rand(1).item() < 0.5:
-                jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2)
+                jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2)
                 image = jitter(image)
-
-        image = F.rgb_to_grayscale(image)
-        image = F.to_tensor(image)
-
-        if self.is_train:
+            
             image = F.pad(image, padding=92, fill=0, padding_mode="reflect")
+
+        image = F.to_tensor(image)
+        image = F.normalize(image, mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
         trimap = np.array(trimap)
         trimap = (trimap == 1).astype(np.uint8)
@@ -112,13 +87,13 @@ if __name__ == "__main__":
 
     from src.utils import plot_sample
 
-    dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet", split_file = "train.txt", is_train = False)
+    dataset = OxfordPetDataset(root="dataset/oxford-iiit-pet", split_file="train.txt", is_train=False)
     image, trimap, idx = dataset[0]
 
     size = dataset.load_image(idx).size[::-1]
 
     image = image[:, 92:-92, 92:-92].float()
-    image = F.resize(image, size = size).squeeze(0)
-    trimap = F.resize(trimap.unsqueeze(0).float(), size = size, interpolation =F.InterpolationMode.NEAREST).squeeze(0)
+    image = F.resize(image, size=size).permute(1, 2, 0).numpy()  # H×W×3 for plot_sample
+    trimap = F.resize(trimap.unsqueeze(0).float(), size=size, interpolation=F.InterpolationMode.NEAREST).squeeze(0)
 
-    plot_sample(image.numpy(), trimap.numpy(), image_title="Image", mask_title="Trimap", save_path="sample.png")
+    plot_sample(image, trimap.numpy(), image_title="Image", mask_title="Trimap", save_path="sample.png")

@@ -5,7 +5,6 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from tqdm import tqdm
 from src.models.unet import UNet
 from src.models.resnet34_unet import ResNet34UNet
@@ -13,8 +12,7 @@ from torch.utils.data import DataLoader
 from src.oxford_pet import OxfordPetDataset
 from src.evaluate import dice_score, combined_loss, combined_loss_lovasz
 from src.utils import (
-    prepare_five_crops,
-    stitch_five_crop_results,
+    predict_full_image,
     print_training_config,
     plot_training_curves,
 )
@@ -46,12 +44,12 @@ P1_EPOCHS         = 50
 P2_EPOCHS         = 100
 DICE_WEIGHT       = 2.0
 LOVASZ_WEIGHT     = 0.8
-P2_LR_DIVISOR     = 10
+P2_LR_DIVISOR     = 8
 FOCAL_GAMMA       = 0.0
 
 # Optimizer hyperparameters
-WEIGHT_DECAY  = 1e-3
-LEARNING_RATE = 2e-4
+WEIGHT_DECAY  = 5e-4
+LEARNING_RATE = 1e-4
 
 # Scheduler hyperparameters
 P1_WARMUP_EPOCHS      = 5
@@ -109,8 +107,24 @@ def train_one_epoch(model, optimizer, loss, train_dataloader, scheduler = None) 
 
     return training_loss / len(train_dataloader)
         
-def validate_one_epoch(model, val_dataset):
-    
+def validate_one_epoch(
+    model: UNet,
+    val_dataset: OxfordPetDataset,
+) -> tuple[float, float]:
+    """Validate with full-image inference: resize → normalize → pad → model → upsample.
+
+    The image is resized to ``TARGET_SIZE``, padded by 92 px on all sides
+    (matching the training input convention), passed through the model, then
+    bilinearly upsampled back to the original resolution for loss and Dice
+    computation.
+
+    Args:
+        model: Trained UNet model.
+        val_dataset: Validation dataset (``is_train=False``).
+
+    Returns:
+        Tuple of (mean_val_loss, mean_dice_score).
+    """
     model.eval()
     validation_loss  = 0.0
     epoch_dice_score = 0.0
@@ -118,23 +132,22 @@ def validate_one_epoch(model, val_dataset):
     with torch.no_grad():
         val_pbar = tqdm(range(len(val_dataset)), desc="Validation")
         for idx in val_pbar:
-            pil_image = val_dataset.load_image(idx).convert("RGB")
+            # dataset[idx] returns (normalized_tensor [3,H,W], trimap, idx)
+            img_normalized, _, _ = val_dataset[idx]
 
-            batch, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig = prepare_five_crops(pil_image)
-            batch = batch.to(DEVICE)
-
-            probs = torch.softmax(model(batch), dim = 1).cpu()
-
-            stitched = stitch_five_crop_results(probs, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)
+            stitched = predict_full_image(
+                lambda b: torch.softmax(model(b.to(DEVICE)), dim=1),
+                img_normalized,
+            )  # [2, H_orig, W_orig]
 
             trimap_np = (np.array(val_dataset.load_trimap(idx)) == 1).astype(np.uint8)
-            trimap_t = torch.from_numpy(trimap_np).long()
+            trimap_t  = torch.from_numpy(trimap_np).long()
 
-            log_probs = torch.log(stitched.clamp(min = 1e-8))
+            log_probs  = torch.log(stitched.clamp(min=1e-8))
             loss_value = F.nll_loss(log_probs.unsqueeze(0), trimap_t.unsqueeze(0))
             validation_loss += loss_value.item()
 
-            pred = torch.argmax(stitched, dim = 0).float()
+            pred = torch.argmax(stitched, dim=0).float()
             epoch_dice_score += dice_score(pred, trimap_t.float())
 
             val_pbar.set_postfix({"loss": f"{loss_value.item():.6f}"})
@@ -149,10 +162,11 @@ if __name__ == "__main__":
         model  = torch.compile(ResNet34UNet().to(DEVICE))
 
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    save_dir      = os.path.join("saved_models", MODEL_NAME, run_timestamp)
+    _model_slug   = MODEL_NAME.lower()
+    save_dir      = os.path.join("saved_models", _model_slug, run_timestamp)
     os.makedirs(save_dir, exist_ok = True)
-    p1_best_model_path = os.path.join(save_dir, f"{MODEL_NAME}_p1.pth")
-    p2_best_model_path = os.path.join(save_dir, f"{MODEL_NAME}_p2.pth")
+    p1_best_model_path = os.path.join(save_dir, f"{_model_slug}_p1.pth")
+    p2_best_model_path = os.path.join(save_dir, f"{_model_slug}_p2.pth")
 
     print_training_config(
         run_timestamp            = run_timestamp,

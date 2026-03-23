@@ -7,7 +7,7 @@ import torchvision.transforms.functional as TF
 
 from PIL import Image
 from tqdm import tqdm
-from typing import Optional
+from typing import Callable, Optional
 
 
 def print_training_config(
@@ -32,45 +32,84 @@ def print_training_config(
     patience_phase1: int,
     p2_lr_divisor: int,
     patience_phase2: int,
-    width: int = 60,
+    min_width: int = 72,
 ) -> None:
-
-    W   = width
-    pad = W - 26
     p2_lr = learning_rate / p2_lr_divisor
 
-    def row(label: str, value: object) -> str:
-        return f"║  {label:<22} {str(value):>{pad}} ║"
+    LABEL_W = 22
 
-    tqdm.write("╔" + "═" * W + "╗")
-    tqdm.write("║" + " Training Configuration ".center(W) + "║")
-    tqdm.write("╠" + "═" * W + "╣")
-    tqdm.write(row("Start Time",          run_timestamp))
-    tqdm.write(row("Device",              device))
-    tqdm.write(row("Model",               model_name))
-    tqdm.write(row("Phase 1 Save",        p1_best_model_path))
-    tqdm.write(row("Phase 2 Save",        p2_best_model_path))
-    tqdm.write("╠" + "─" * W + "╣")
-    tqdm.write("║" + " Phase 1 — Focal + Dice ".center(W) + "║")
-    tqdm.write("╠" + "─" * W + "╣")
-    tqdm.write(row("Epochs (max)",        phase1_epochs))
-    tqdm.write(row("Batch Size",          batch_size))
-    tqdm.write(row("Learning Rate",       learning_rate))
-    tqdm.write(row("Weight Decay",        weight_decay))
-    tqdm.write(row("Loss",                f"Focal(gamma = 0.0) + {dice_alpha}x Dice"))
-    tqdm.write(row("Scheduler",           f"LinearLR warmup {p1_warmup_epochs} ep ({p1_warmup_start_factor}x -> 1.0) + CosineAnnealingLR ({p1_cosine_eta_min_factor} min factor)"))
-    tqdm.write(row("Early Stop Patience", patience_phase1))
-    tqdm.write("╠" + "─" * W + "╣")
-    tqdm.write("║" + " Phase 2 — Focal + Lovász ".center(W) + "║")
-    tqdm.write("╠" + "─" * W + "╣")
-    tqdm.write(row("Epochs (max)",           phase2_epochs))
-    tqdm.write(row("Batch Size",             batch_size))
-    tqdm.write(row("Learning Rate",          p2_lr))
-    tqdm.write(row("Weight Decay",           weight_decay / 20))
-    tqdm.write(row("Loss",                   f"Focal(gamma = 0.0) + {lovasz_beta}x Lovász"))
-    tqdm.write(row("Scheduler",              f"LinearLR warmup {p2_warmup_epochs} ep ({p2_warmup_start_factor}x -> 1.0) + CosineAnnealingLR ({p2_cosine_eta_min_factor} min factor)"))
-    tqdm.write(row("Early Stop Patience",    patience_phase2))
-    tqdm.write("╚" + "═" * W + "╝")
+    def fmt_sched(warmup_ep: int, start_f: float, eta_f: float) -> str:
+        return (
+            f"LinearLR warmup {warmup_ep} ep "
+            f"({start_f}x → 1.0)  +  CosineAnnealingLR ({eta_f} min factor)"
+        )
+
+    header_rows: list[tuple[str, object]] = [
+        ("Start Time",   run_timestamp),
+        ("Device",       device),
+        ("Model",        model_name),
+        ("Phase 1 Save", p1_best_model_path),
+        ("Phase 2 Save", p2_best_model_path),
+    ]
+    p1_rows: list[tuple[str, object]] = [
+        ("Epochs (max)",        phase1_epochs),
+        ("Batch Size",          batch_size),
+        ("Learning Rate",       learning_rate),
+        ("Weight Decay",        weight_decay),
+        ("Loss",                f"Focal(γ=0.0)  +  {dice_alpha}× Dice"),
+        ("Scheduler",           fmt_sched(p1_warmup_epochs, p1_warmup_start_factor, p1_cosine_eta_min_factor)),
+        ("Early Stop Patience", patience_phase1),
+    ]
+    p2_rows: list[tuple[str, object]] = [
+        ("Epochs (max)",        phase2_epochs),
+        ("Batch Size",          batch_size),
+        ("Learning Rate",       p2_lr),
+        ("Weight Decay",        weight_decay / 20),
+        ("Loss",                f"Focal(γ=0.0)  +  {lovasz_beta}× Lovász"),
+        ("Scheduler",           fmt_sched(p2_warmup_epochs, p2_warmup_start_factor, p2_cosine_eta_min_factor)),
+        ("Early Stop Patience", patience_phase2),
+    ]
+
+    # Auto-fit width so no value ever wraps
+    all_rows = header_rows + p1_rows + p2_rows
+    inner_w  = max(min_width, max(LABEL_W + 4 + len(str(v)) + 2 for _, v in all_rows))
+
+    def hline(left: str = "╠", fill: str = "═", right: str = "╣") -> None:
+        tqdm.write(left + fill * inner_w + right)
+
+    def section(title: str) -> None:
+        hline("╠", "─", "╣")
+        tqdm.write("║" + title.center(inner_w) + "║")
+        hline("╠", "─", "╣")
+
+    def row(label: str, value: object) -> str:
+        body = f"  {label:<{LABEL_W}}  {value}"
+        return f"║{body:<{inner_w}}║"
+
+    def blank() -> None:
+        tqdm.write("║" + " " * inner_w + "║")
+
+    hline("╔", "═", "╗")
+    tqdm.write("║" + " ✦  Training Configuration  ✦ ".center(inner_w) + "║")
+    hline("╠", "═", "╣")
+    blank()
+    for label, value in header_rows:
+        tqdm.write(row(label, value))
+    blank()
+
+    section("  Phase 1  —  Focal + Dice  ")
+    blank()
+    for label, value in p1_rows:
+        tqdm.write(row(label, value))
+    blank()
+
+    section("  Phase 2  —  Focal + Lovász  ")
+    blank()
+    for label, value in p2_rows:
+        tqdm.write(row(label, value))
+    blank()
+
+    hline("╚", "═", "╝")
 
 
 
@@ -155,12 +194,13 @@ def prepare_five_crops(
     pad_size: int = 92,
 ) -> tuple[torch.Tensor, list[tuple[int, int]], int, int, int, int, int, int]:
     
-    """Return a [5, 1, 572, 572] batch and stitching metadata for one image.
+    """Return a [5, 3, 572, 572] batch and stitching metadata for one image.
 
     Returns ``(batch, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)``.
     Pass all return values directly to :func:`stitch_five_crop_results`.
     """
-    img_t = TF.to_tensor(TF.to_grayscale(pil_image))
+    img_t = TF.to_tensor(pil_image.convert("RGB"))
+    img_t = TF.normalize(img_t, mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
     H_orig, W_orig = img_t.shape[1], img_t.shape[2]
 
     # TF.five_crop raises if image is smaller than crop_size
@@ -217,3 +257,43 @@ def stitch_five_crop_results(
     result = accum / count.unsqueeze(0).clamp(min = 1.0)
     
     return result[:, pad_top:pad_top + H_orig, pad_left:pad_left + W_orig]
+
+
+def predict_full_image(
+    forward_fn: Callable[[torch.Tensor], torch.Tensor],
+    img_normalized: torch.Tensor,
+    crop_size: int = 388,
+    pad_size: int = 92,
+) -> torch.Tensor:
+    """Full-image inference: resize → pad → forward → upsample back to original size.
+
+    The normalized image is resized to ``crop_size × crop_size``, padded by
+    ``pad_size`` on all sides (producing a ``(crop_size + 2*pad_size)²`` model
+    input), passed through ``forward_fn``, and the result is bilinearly
+    upsampled back to the original spatial resolution.
+
+    ``forward_fn`` receives a ``[1, 3, H_in, W_in]`` batch and must return a
+    ``[1, 2, crop_size, crop_size]`` softmax-probability tensor.  Device
+    placement is the caller's responsibility (move the batch inside
+    ``forward_fn``).
+
+    Args:
+        forward_fn: Callable that takes a CPU batch and returns probabilities
+            (e.g. ``lambda b: tta_predict(model, b.to(device))`` or
+            ``lambda b: torch.softmax(model(b.to(device)), dim=1)``).
+        img_normalized: ImageNet-normalised image tensor of shape
+            ``[3, H_orig, W_orig]``.
+        crop_size: Spatial size to rescale the image to before padding.
+        pad_size: Padding added on each side to reach the full model input.
+
+    Returns:
+        Softmax probability tensor of shape ``[2, H_orig, W_orig]`` on CPU.
+    """
+    H_orig, W_orig = img_normalized.shape[1], img_normalized.shape[2]
+
+    img_resized = TF.resize(img_normalized, [crop_size, crop_size], antialias=True)
+    img_padded  = TF.pad(img_resized, pad_size, padding_mode="constant")
+    batch       = img_padded.unsqueeze(0)  # [1, 3, crop+2*pad, crop+2*pad]
+
+    probs = forward_fn(batch).cpu()  # [1, 2, crop_size, crop_size]
+    return TF.resize(probs.squeeze(0), [H_orig, W_orig], antialias=True)  # [2, H_orig, W_orig]

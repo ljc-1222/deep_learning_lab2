@@ -1,5 +1,5 @@
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 
 
 def dice_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -7,29 +7,26 @@ def dice_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 2.0 * (pred * target).sum() / (pred.sum() + target.sum() + 1e-8)
 
 
-def dice_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def dice_sum_batch(preds: torch.Tensor, target: torch.Tensor) -> float:
+
+    pred_bin = (torch.sigmoid(preds)).float()
+    total = 0.0
     
-    pred_prob   = torch.softmax(pred_logits, dim=1)[:, 1]
-    target_f    = target.float()
-    numerator   = 2.0 * (pred_prob * target_f).sum()
-    denominator = pred_prob.sum() + target_f.sum() + 1e-8
-    
-    return 1.0 - numerator / denominator
+    for i in range(pred_bin.shape[0]):
+        total += float(dice_score(pred_bin[i].squeeze(0), target[i].squeeze(0)))
+        
+    return total
 
 
-def tv_loss(pred_logits: torch.Tensor) -> torch.Tensor:
+def dice_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     
-    pred_prob = torch.softmax(pred_logits, dim=1)[:, 1]
-    diff_h    = (pred_prob[:, 1:, :] - pred_prob[:, :-1, :]).abs()
-    diff_w    = (pred_prob[:, :, 1:] - pred_prob[:, :, :-1]).abs()
-    
-    return diff_h.mean() + diff_w.mean()
+    return 1.0 - dice_score(pred, target)
 
+def combined_loss(preds: torch.Tensor, target: torch.Tensor, weight: float = 0.5) -> torch.Tensor:
 
-def combined_loss(pred_logits: torch.Tensor, target: torch.Tensor, alpha: float = 1.0, beta: float  = 0.1) -> torch.Tensor:
-
-    ce   = F.cross_entropy(pred_logits, target)
-    dice = dice_loss(pred_logits, target)
-    tv   = tv_loss(pred_logits)
-    
-    return ce + alpha * dice + beta * tv
+    preds = torch.sigmoid(preds)
+    bce   = nn.BCELoss()(preds, target)
+    dice  = dice_loss(preds, target)
+        
+    return weight * bce + (1 - weight) * dice

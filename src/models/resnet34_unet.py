@@ -21,7 +21,7 @@ class BasicBlock(nn.Module):
                 nn.Conv2d(in_channels, out_channels, kernel_size = 1, stride = stride, bias = False),
                 nn.BatchNorm2d(out_channels))
             
-            if stride != 1 or in_channels != out_channels
+            if stride!= 1 or in_channels!= out_channels
             else nn.Identity()
         )
         self.relu = nn.ReLU(inplace = True)
@@ -96,13 +96,13 @@ class ResNet34UNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         
         # Encoder path
-        s  = self.stem(x)                 # [B, 64, H/2, W/2]
-        s_pool = self.maxpool(s)          # [B, 64, H/4, W/4]
-        
-        e1 = self.layer1(s_pool)          # [B, 64, H/4, W/4]
-        e2 = self.layer2(e1)              # [B, 128, H/8, W/8]
-        e3 = self.layer3(e2)              # [B, 256, H/16, W/16]
-        e4 = self.layer4(e3)              # [B, 512, H/32, W/32]
+        s  = self.stem(x)                   
+        s_pool = self.maxpool(s)            
+
+        e1 = self.layer1(s_pool)            
+        e2 = self.layer2(e1)                
+        e3 = self.layer3(e2)                
+        e4 = self.layer4(e3)                
 
         # Decoder path: upsample → concat skip → decode conv
         u4 = self.up4(e4); d4 = self.dec4(torch.cat([e3, u4], dim = 1))

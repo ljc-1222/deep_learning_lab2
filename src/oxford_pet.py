@@ -1,47 +1,28 @@
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
+import cv2
 import torch
 import numpy as np
 import albumentations as A
 import torchvision.transforms.functional as F
 
 from PIL import Image
+from tqdm import tqdm
 from torch.utils.data import Dataset
 from albumentations.pytorch import ToTensorV2
 
-RESIZE_MAP = {
-    "UNet": {
-        "IMAGE_SIZE": 364,
-        "MASK_SIZE": 180,
-    },
-    "ResNet34UNet": {
-        "IMAGE_SIZE": 384,
-        "MASK_SIZE": 384,
-    }
-}
 
 def train_transform() -> A.Compose:
 
     return A.Compose(
         [
             A.HorizontalFlip(p = 0.5),
-            A.VerticalFlip(p = 0.5),
-            A.Affine(
-                shear = 10,
-                scale = 0.1,
-                translate_percent = 0.1,
-                rotate = 10,
-                p = 0.5,
-            ),
-            A.ColorJitter(
-                brightness = 0.2,
-                contrast   = 0.2,
-                saturation = 0.2,
-                hue        = 0.2,
-                p          = 0.5,
-            ),
-            A.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]),
+            A.SafeRotate(limit = 20, p = 0.5),
+            A.Sharpen(alpha = (0.2, 0.5), lightness = (0.5, 1.0), p = 0.5),
+            A.Blur(blur_limit = (3, 5), p = 0.5),
+            A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
+                        std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
             ToTensorV2(),
         ],
     )
@@ -51,10 +32,29 @@ def eval_transform() -> A.Compose:
 
     return A.Compose(
         [
-            A.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]),
+            A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
+                        std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
             ToTensorV2(),
         ],
     )
+    
+def apply_clahe_rgb(image: np.ndarray) -> np.ndarray:
+
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    # Apply CLAHE only on the L channel in LAB space.
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    
+    clahe = cv2.createCLAHE(clipLimit = 2.0, tileGridSize = (8, 8))
+    l_channel = clahe.apply(l_channel)
+    
+    lab = cv2.merge((l_channel, a_channel, b_channel))
+    rgb_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    
+    return rgb_enhanced
+
 class OxfordPetDataset(Dataset):
 
     def __init__(
@@ -63,6 +63,7 @@ class OxfordPetDataset(Dataset):
         split_file: Union[str, Path],
         is_train: bool = False,
         model_name: str = "UNet",
+        resize_map: dict = None,
     ) -> None:
         
         self.root = Path(root)
@@ -70,7 +71,8 @@ class OxfordPetDataset(Dataset):
         self.is_train = is_train
         self.transform = train_transform() if is_train else eval_transform()
         self.model_name = model_name
-
+        self.resize_map = resize_map
+        
         with open(self.split_file, "r", encoding = "utf-8") as f:
             sample_ids = [line.strip() for line in f if line.strip()]
 
@@ -105,25 +107,33 @@ class OxfordPetDataset(Dataset):
         trimap = np.array(self.load_trimap(idx))
         mask = self._trimap_to_binary_mask(trimap)
 
+        image = apply_clahe_rgb(image)
         transformed = self.transform(image = image, mask = mask)
         image_t = transformed["image"]
         mask_t = transformed["mask"].unsqueeze(0)
         
         image_t = F.resize(image_t, 
-                           size = (RESIZE_MAP[self.model_name]["IMAGE_SIZE"], 
-                                   RESIZE_MAP[self.model_name]["IMAGE_SIZE"]), 
-                           interpolation = F.InterpolationMode.NEAREST
+                           size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                           interpolation = F.InterpolationMode.BILINEAR
                            )
-        mask_t  = F.resize(mask_t, 
-                           size = (RESIZE_MAP[self.model_name]["MASK_SIZE"], 
-                                   RESIZE_MAP[self.model_name]["MASK_SIZE"]), 
-                           interpolation = F.InterpolationMode.NEAREST
-                           )
+        
+        # Pad the image to IMAGE_SIZE if model is UNet
+        if self.model_name == "UNet":
+            image_t = F.pad(image_t, 
+                            padding = 92,
+                            padding_mode = "constant"
+                            )
+            
+        mask_t = F.resize(mask_t, 
+                          size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                          interpolation = F.InterpolationMode.NEAREST
+                          )
 
         return image_t, mask_t, idx
 
 
 if __name__ == "__main__":
+    
     import matplotlib.pyplot as plt
 
     dataset = OxfordPetDataset(
@@ -131,6 +141,16 @@ if __name__ == "__main__":
         split_file = "train.txt",
         is_train = False,
         model_name = "UNet",
+        resize_map = {
+            "UNet": {
+                "IMAGE_SIZE": (396, 396),
+                "MASK_SIZE": (396 - 184, 396 - 184),
+            },
+            "ResNet34UNet": {
+                "IMAGE_SIZE": (256, 256),
+                "MASK_SIZE": (256, 256),
+            }
+        }
     )
     
     image, trimap, idx = dataset[0]
@@ -157,3 +177,4 @@ if __name__ == "__main__":
     axes[1].axis("off")
     plt.tight_layout()
     plt.show()
+

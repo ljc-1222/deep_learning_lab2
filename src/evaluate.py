@@ -1,5 +1,7 @@
 import torch
+import numpy as np
 import torch.nn.functional as F
+import segmentation_models_pytorch as smp
 
 
 def dice_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -25,13 +27,17 @@ def dice_sum_batch(preds: torch.Tensor, target: torch.Tensor, soft: bool = True)
 
 def dice_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
-    return 1.0 - dice_score(pred, target)
+    return torch.log(torch.cosh(1.0 - dice_score(pred, target)))
 
+def lovasz_softmax_loss(preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    
+    return smp.losses.LovaszLoss(mode = "binary", ignore_index = None)(preds, target)
 
-def combined_loss(preds: torch.Tensor, target: torch.Tensor, weight: float = 0.5) -> torch.Tensor:
+def combined_loss(preds: torch.Tensor, target: torch.Tensor, weight0: float = 1.0, weight1: float = 1.0, weight2: float = 1.0) -> torch.Tensor:
 
     bce  = F.binary_cross_entropy_with_logits(preds, target)
     prob = torch.sigmoid(preds)
     dice = dice_loss(prob, target)
-
-    return weight * bce + (1 - weight) * dice
+    lovasz = lovasz_softmax_loss(prob, target)
+    
+    return weight0 * bce + weight1 * dice + weight2 * lovasz

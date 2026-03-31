@@ -22,20 +22,28 @@ def save_training_config(
     save_dir: str,
     run_timestamp: str,
     best_model_path: str,
+    resize_map: dict,
     device: str,
     model_name: str,
     num_epochs: int,
     batch_size: int,
     learning_rate: float,
     weight_decay: float,
-    combined_loss_weight: float,
+    weight_bce: float,
+    weight_dice: float,
+    weight_lovasz: float,
     patience: int,
-    warmup_epochs: int,
-    warmup_factor: float,
-    eta_min_rate: float,
+    onecycle_max_lr: float,
+    onecycle_pct_start: float,
+    onecycle_div_factor: float,
+    onecycle_final_div_factor: float,
+    onecycle_three_phase: bool,
+    swa_start_epoch: int,
+    swa_lr: float,
+    swa_anneal_epochs: int,
     use_bf16: bool,
     cudnn_benchmark: bool,
-    width: int = 60,
+    width: int = 72,
 ) -> None:
     
     # print training configuration
@@ -49,6 +57,8 @@ def save_training_config(
     tqdm.write("║" + " Training Configuration ".center(W) + "║")
     tqdm.write("╠" + "═" * W + "╣")
     tqdm.write(row("Start Time",          run_timestamp))
+    tqdm.write(row("Image Size",          resize_map["IMAGE_SIZE"]))
+    tqdm.write(row("Mask Size",           resize_map["MASK_SIZE"]))
     tqdm.write(row("Device",              device))
     tqdm.write(row("Model",               model_name))
     amp_dtype = "bfloat16" if use_bf16 else "float32"
@@ -59,16 +69,20 @@ def save_training_config(
     tqdm.write(row("Batch Size",          batch_size))
     tqdm.write(row("Learning Rate",       learning_rate))
     tqdm.write(row("Weight Decay",        weight_decay))
-    tqdm.write(row("Warmup Epochs",       warmup_epochs))
-    tqdm.write(row("Warmup Factor",       warmup_factor))
-    tqdm.write(row("ETA Min Rate",        eta_min_rate))
+    tqdm.write(row("OneCycle Max LR",     onecycle_max_lr))
+    tqdm.write(row("OneCycle Pct Start",  onecycle_pct_start))
+    tqdm.write(row("OneCycle Div Factor", onecycle_div_factor))
+    tqdm.write(row("OneCycle Final Div",  onecycle_final_div_factor))
+    tqdm.write(row("OneCycle 3-Phase",    onecycle_three_phase))
+    tqdm.write(row("SWA Start Epoch",     swa_start_epoch))
+    tqdm.write(row("SWA LR",              swa_lr))
+    tqdm.write(row("SWA Anneal Epochs",   swa_anneal_epochs))
     tqdm.write(row("Early Stop Patience", patience))
     tqdm.write("╠" + "─" * W + "╣")
-    dice_w = 1.0 - combined_loss_weight
     tqdm.write(
         row(
             "Loss",
-            f"{combined_loss_weight}×BCE + {dice_w}×Dice",
+            f"{weight_bce}×BCE + {weight_dice}×Dice + {weight_lovasz}×Lovasz",
         )
     )
     tqdm.write(row("Checkpoint",          os.path.basename(best_model_path)))
@@ -79,6 +93,8 @@ def save_training_config(
     with open(os.path.join(save_dir, "training_config.json"), "w") as f:
         json.dump({
             "Run Timestamp": run_timestamp,
+            "Image Size": resize_map["IMAGE_SIZE"],
+            "Mask Size": resize_map["MASK_SIZE"],
             "Device": device,
             "Model": model_name,
             "AMP dtype": "bfloat16" if use_bf16 else "float32",
@@ -88,13 +104,20 @@ def save_training_config(
             "Batch Size": batch_size,
             "Learning Rate": learning_rate,
             "Weight Decay": weight_decay,
-            "Warmup Epochs": warmup_epochs,
-            "Warmup Factor": warmup_factor,
-            "ETA Min Rate": eta_min_rate,
+            "OneCycle Max LR": onecycle_max_lr,
+            "OneCycle Pct Start": onecycle_pct_start,
+            "OneCycle Div Factor": onecycle_div_factor,
+            "OneCycle Final Div Factor": onecycle_final_div_factor,
+            "OneCycle Three Phase": onecycle_three_phase,
+            "SWA Start Epoch": swa_start_epoch,
+            "SWA LR": swa_lr,
+            "SWA Anneal Epochs": swa_anneal_epochs,
             "Early Stop Patience": patience,
-            "Combined Loss Weight (BCE)": combined_loss_weight,
+            "Weight BCE": weight_bce,
+            "Weight Dice": weight_dice,
+            "Weight Lovasz": weight_lovasz,
             "Loss": (
-                f"{combined_loss_weight} * BCE + {1.0 - combined_loss_weight} * Dice"
+                f"{weight_bce} * BCE + {weight_dice} * Dice + {weight_lovasz} * Lovasz"
             ),
         }, f, indent = 4)
 

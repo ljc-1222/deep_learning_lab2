@@ -19,7 +19,6 @@ def train_transform() -> A.Compose:
         [
             A.HorizontalFlip(p = 0.5),
             A.SafeRotate(limit = 20, p = 0.5),
-            A.Sharpen(alpha = (0.2, 0.5), lightness = (0.5, 1.0), p = 0.5),
             A.Blur(blur_limit = (3, 5), p = 0.5),
             A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
                         std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
@@ -113,7 +112,7 @@ class OxfordPetDataset(Dataset):
         mask_t = transformed["mask"].unsqueeze(0)
         
         image_t = F.resize(image_t, 
-                           size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                           size = (self.resize_map[self.model_name]), 
                            interpolation = F.InterpolationMode.BILINEAR
                            )
         
@@ -125,7 +124,7 @@ class OxfordPetDataset(Dataset):
                             )
             
         mask_t = F.resize(mask_t, 
-                          size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                          size = (self.resize_map[self.model_name]), 
                           interpolation = F.InterpolationMode.NEAREST
                           )
 

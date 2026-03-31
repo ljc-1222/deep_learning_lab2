@@ -26,8 +26,7 @@ def save_training_config(
     resize_map: dict,
     device: str,
     model_name: str,
-    phase1_epochs: int,
-    phase2_epochs: int,
+    num_epochs: int,
     batch_size: int,
     learning_rate: float,
     weight_decay: float,
@@ -59,8 +58,7 @@ def save_training_config(
     tqdm.write("║" + " Training Configuration ".center(W) + "║")
     tqdm.write("╠" + "═" * W + "╣")
     tqdm.write(row("Start Time",          run_timestamp))
-    tqdm.write(row("Image Size",          resize_map["IMAGE_SIZE"]))
-    tqdm.write(row("Mask Size",           resize_map["MASK_SIZE"]))
+    tqdm.write(row("Image Size",          resize_map[model_name]))
     tqdm.write(row("Device",              device))
     tqdm.write(row("Model",               model_name))
     amp_dtype = "bfloat16" if use_bf16 else "float32"
@@ -69,15 +67,15 @@ def save_training_config(
     tqdm.write("╠" + "─" * W + "╣")
     tqdm.write(row("Epochs",              num_epochs))
     tqdm.write(row("Batch Size",          batch_size))
-    tqdm.write(row("Learning Rate",       learning_rate))
-    tqdm.write(row("Weight Decay",        weight_decay))
-    tqdm.write(row("OneCycle Max LR",     onecycle_max_lr))
+    tqdm.write(row("Learning Rate",       f"{learning_rate:.4g}"))
+    tqdm.write(row("Weight Decay",        f"{weight_decay:.4g}"))
+    tqdm.write(row("OneCycle Max LR",     f"{onecycle_max_lr:.4g}"))
     tqdm.write(row("OneCycle Pct Start",  onecycle_pct_start))
     tqdm.write(row("OneCycle Div Factor", onecycle_div_factor))
     tqdm.write(row("OneCycle Final Div",  onecycle_final_div_factor))
     tqdm.write(row("OneCycle 3-Phase",    onecycle_three_phase))
     tqdm.write(row("SWA Start Epoch",     swa_start_epoch))
-    tqdm.write(row("SWA LR",              swa_lr))
+    tqdm.write(row("SWA LR",              f"{swa_lr:.4g}"))
     tqdm.write(row("SWA Anneal Epochs",   swa_anneal_epochs))
     tqdm.write(row("Early Stop Patience", patience))
     tqdm.write("╠" + "─" * W + "╣")
@@ -95,8 +93,7 @@ def save_training_config(
     with open(os.path.join(save_dir, "training_config.json"), "w") as f:
         json.dump({
             "Run Timestamp": run_timestamp,
-            "Image Size": resize_map["IMAGE_SIZE"],
-            "Mask Size": resize_map["MASK_SIZE"],
+            "Image Size": resize_map[model_name],
             "Device": device,
             "Model": model_name,
             "AMP dtype": "bfloat16" if use_bf16 else "float32",

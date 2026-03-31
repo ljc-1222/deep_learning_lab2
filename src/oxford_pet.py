@@ -131,6 +131,7 @@ class OxfordPetDataset(Dataset):
 
         return image_t, mask_t, idx
 
+        return image, trimap, idx
 
 if __name__ == "__main__":
     

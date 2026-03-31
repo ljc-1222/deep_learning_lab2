@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from tqdm import tqdm
+from typing import Callable, Optional
 
 
 def rle_encode(mask: np.ndarray) -> str:
@@ -25,7 +26,8 @@ def save_training_config(
     resize_map: dict,
     device: str,
     model_name: str,
-    num_epochs: int,
+    phase1_epochs: int,
+    phase2_epochs: int,
     batch_size: int,
     learning_rate: float,
     weight_decay: float,

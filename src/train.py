@@ -4,6 +4,9 @@ import contextlib
 import torch
 import numpy as np
 
+import numpy as np
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
@@ -77,7 +80,6 @@ SWA_ANNEAL_EPOCHS = 20
 # Early stopping hyperparameters
 PATIENCE = 50
 
-# Set seed
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -95,12 +97,14 @@ val_dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet",
                                resize_map = RESIZE_MAP
                                )
 
-train_dataloader = DataLoader(train_dataset, 
-                                   batch_size = BATCH_SIZE, 
-                                   shuffle = True, 
-                                   num_workers = NUM_WORKERS,
-                                   pin_memory = True,
-                                   persistent_workers = True)
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size = BATCH_SIZE,
+    shuffle = True,
+    num_workers = NUM_WORKERS,
+    pin_memory = True,
+    persistent_workers = True,
+)
 
 val_dataloader = DataLoader(val_dataset, 
                                  batch_size = BATCH_SIZE, 
@@ -190,7 +194,9 @@ def train_one_epoch(
 def validate_one_epoch(model, loss, val_dataloader) -> tuple[float, float]:
     
     model.eval()
-    
+    validation_loss  = 0.0
+    epoch_dice_score = 0.0
+
     with torch.no_grad():
     
         loss_sum = 0.0
@@ -219,6 +225,11 @@ def validate_one_epoch(model, loss, val_dataloader) -> tuple[float, float]:
 
 
 if __name__ == "__main__":
+    
+    if MODEL_NAME == "UNet":
+        model  = torch.compile(UNet().to(DEVICE))
+    elif MODEL_NAME == "ResNet34_UNet":
+        model  = torch.compile(ResNet34UNet().to(DEVICE))
 
     torch.cuda.empty_cache()
 
@@ -307,6 +318,7 @@ if __name__ == "__main__":
                         break
 
     finally:
+        # Plot training curves
         if train_losses:
             if swa_updates > 0:
                 if MODEL_NAME == "ResNet34UNet":  # Recompute BN running stats before exporting SWA model.

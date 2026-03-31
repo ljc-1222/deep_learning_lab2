@@ -5,20 +5,12 @@ class DoubleConv(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size = 3),
+            nn.ReLU(inplace = True),
+            nn.Conv2d(out_channels, out_channels, kernel_size = 3),
+            nn.ReLU(inplace = True),
         )
-        self._initialize_weights() 
-
-    def _initialize_weights(self):
-        for m in self.block.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode = 'fan_out', nonlinearity = 'relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
 
@@ -49,7 +41,8 @@ class UNet(nn.Module):
         self.dec1 = DoubleConv(128, 64)
 
         self.pool = nn.MaxPool2d(kernel_size = 2)
-        self.head = nn.Conv2d(64, 2, kernel_size = 1)
+        self.head = nn.Conv2d(64, 1, kernel_size = 1)
+
 
     @staticmethod
     def center_crop(src: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -69,10 +62,10 @@ class UNet(nn.Module):
         b  = self.bottleneck(self.pool(e4))
 
         # Decoder path: upsample → crop-and-concat skip → double conv
-        u4 = self.up4(b);  d4 = self.dec4(torch.cat([self.center_crop(e4, u4), u4], dim=1))
-        u3 = self.up3(d4); d3 = self.dec3(torch.cat([self.center_crop(e3, u3), u3], dim=1))
-        u2 = self.up2(d3); d2 = self.dec2(torch.cat([self.center_crop(e2, u2), u2], dim=1))
-        u1 = self.up1(d2); d1 = self.dec1(torch.cat([self.center_crop(e1, u1), u1], dim=1))
+        u4 = self.up4(b);  d4 = self.dec4(torch.cat([self.center_crop(e4, u4), u4], dim = 1))
+        u3 = self.up3(d4); d3 = self.dec3(torch.cat([self.center_crop(e3, u3), u3], dim = 1))
+        u2 = self.up2(d3); d2 = self.dec2(torch.cat([self.center_crop(e2, u2), u2], dim = 1))
+        u1 = self.up1(d2); d1 = self.dec1(torch.cat([self.center_crop(e1, u1), u1], dim = 1))
 
         return self.head(d1)
 
@@ -82,4 +75,4 @@ if __name__ == "__main__":
     import torchinfo
 
     model = UNet()
-    torchinfo.summary(model, input_size=(1, 3, 572, 572))
+    torchinfo.summary(model, input_size = (1, 3, 364, 364))

@@ -1,76 +1,101 @@
 import os
 import time
-import warnings
+import contextlib
+import torch
+import numpy as np
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from src.models.unet import UNet
-from src.models.resnet34_unet import ResNet34UNet
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+
+from src.models.unet import UNet
 from src.oxford_pet import OxfordPetDataset
-from src.evaluate import dice_score, combined_loss, combined_loss_lovasz
-from src.utils import (
-    predict_full_image,
-    print_training_config,
-    plot_training_curves,
-)
+from src.models.resnet34_unet import ResNet34UNet
+from src.evaluate import combined_loss, dice_sum_batch
+from src.utils import save_training_config, save_training_results
 
-# Number of workers
-NUM_WORKERS = 6
+# Model name
+# MODEL_NAME = "UNet"
+MODEL_NAME = "ResNet34UNet"
 
-# Device
+# Device and number of workers
+NUM_WORKERS = min(8, os.cpu_count())
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# PyTorch SequentialLR internally passes `epoch` to sub-scheduler.step(),
-# which triggers a deprecation UserWarning that is not actionable from user code.
-warnings.filterwarnings(
-    "ignore",
-    message = "The epoch parameter in `scheduler.step\\(\\)`",
-    category = UserWarning,
-    module = "torch.optim.lr_scheduler",
-)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+
+USE_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+
+def _forward_autocast() -> contextlib.AbstractContextManager:
+
+    if USE_BF16:
+        return torch.autocast(device_type = "cuda", dtype = torch.bfloat16)
+    return contextlib.nullcontext()
 
 # Seed
 SEED = 42
 
-# Model selection
-MODEL_NAME = "UNet"
+# Dataset hyperparameters
+BATCH_SIZE = 32
+
+# Image size
+RESIZE_MAP = {
+    "UNet": {
+        "IMAGE_SIZE": (524, 524),
+        "MASK_SIZE": (524 - 184, 524 - 184),
+    },
+    "ResNet34UNet": {
+        "IMAGE_SIZE": (512, 512),
+        "MASK_SIZE": (512, 512),
+    }
+}
 
 # Training hyperparameters
-BATCH_SIZE        = 16
-P1_EPOCHS         = 50
-P2_EPOCHS         = 100
-DICE_WEIGHT       = 2.0
-LOVASZ_WEIGHT     = 0.8
-P2_LR_DIVISOR     = 8
-FOCAL_GAMMA       = 0.0
+NUM_EPOCHS  = 500
+WEIGHT_BCE = 0.1
+WEIGHT_DICE = 0.9
+WEIGHT_LOVAZ = 0.001
+SWA_START_EPOCH = 300
 
 # Optimizer hyperparameters
-WEIGHT_DECAY  = 5e-4
-LEARNING_RATE = 1e-4
+WEIGHT_DECAY  = 1e-4
+LEARNING_RATE = 1.5 * 1e-4
 
-# Scheduler hyperparameters
-P1_WARMUP_EPOCHS      = 5
-P2_WARMUP_EPOCHS      = 3
-P1_WARMUP_START_FACTOR = 0.01
-P2_WARMUP_START_FACTOR = 0.05
-COSINE_ETA_MIN_FACTOR  = 0.01
+# OneCycleLR hyperparameters
+ONECYCLE_MAX_LR = 10 * LEARNING_RATE
+ONECYCLE_PCT_START = 0.45
+ONECYCLE_DIV_FACTOR = 10
+ONECYCLE_FINAL_DIV_FACTOR = 200
+ONECYCLE_THREE_PHASE = True
+ 
+# SWA LR scheduler hyperparameters
+SWA_LR = LEARNING_RATE * 0.5
+SWA_ANNEAL_EPOCHS = 20
 
 # Early stopping hyperparameters
-P1_PATIENCE = 5
-P2_PATIENCE = 12
+PATIENCE = 50
 
 torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 train_dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet", 
                                  split_file = "train.txt", 
-                                 is_train = True)
+                                 is_train = True,
+                                 model_name = MODEL_NAME,
+                                 resize_map = RESIZE_MAP
+                                 )
 
 val_dataset = OxfordPetDataset(root = "dataset/oxford-iiit-pet", 
                                split_file = "val.txt", 
-                               is_train = False)
+                               is_train = False,
+                               model_name = MODEL_NAME,
+                               resize_map = RESIZE_MAP
+                               )
 
 train_dataloader = DataLoader(
     train_dataset,
@@ -81,78 +106,123 @@ train_dataloader = DataLoader(
     persistent_workers = True,
 )
 
-def train_one_epoch(model, optimizer, loss, train_dataloader, scheduler = None) -> float:
+val_dataloader = DataLoader(val_dataset, 
+                                 batch_size = BATCH_SIZE, 
+                                 shuffle = False, 
+                                 num_workers = NUM_WORKERS,
+                                 pin_memory = True,
+                                 persistent_workers = True)
 
-    training_loss = 0.0
+STEPS_PER_EPOCH = len(train_dataloader)
+ONECYCLE_TOTAL_STEPS = SWA_START_EPOCH * STEPS_PER_EPOCH
+
+if MODEL_NAME == "UNet":
+    model = UNet().to(DEVICE)
+elif MODEL_NAME == "ResNet34UNet":
+    model = ResNet34UNet().to(DEVICE)
+else:
+    raise ValueError(f"Invalid model name: {MODEL_NAME}")
+
+model = torch.compile(model)
+
+loss = lambda output, target: combined_loss(output, target, weight0 = WEIGHT_BCE, weight1 = WEIGHT_DICE, weight2 = WEIGHT_LOVAZ)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE, weight_decay = WEIGHT_DECAY)
+swa_model = AveragedModel(model)
+swa_scheduler = SWALR(optimizer, swa_lr = SWA_LR, anneal_epochs = SWA_ANNEAL_EPOCHS)
+
+onecycle_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer = optimizer,
+    max_lr = ONECYCLE_MAX_LR,
+    total_steps = ONECYCLE_TOTAL_STEPS,
+    pct_start = ONECYCLE_PCT_START,
+    div_factor = ONECYCLE_DIV_FACTOR,
+    final_div_factor = ONECYCLE_FINAL_DIV_FACTOR,
+    three_phase = ONECYCLE_THREE_PHASE,
+)
+
+# OneCycleLR is stepped per train batch before SWA starts.
+# SWALR is stepped once per epoch during SWA phase.
+_train_batch_step = 0
+
+
+def train_one_epoch(
+    model,
+    optimizer,
+    loss,
+    train_dataloader,
+    use_swa: bool = False,
+) -> tuple[float, float]:
+
+    loss_sum = 0.0
+    soft_dice_sum = 0.0
+    n_batches = len(train_dataloader)
+    n_samples = len(train_dataloader.dataset)
     model.train()
-    train_pbar = tqdm(train_dataloader, desc="Training  ")
+    train_pbar = tqdm(train_dataloader, desc = "Training  ", leave = False)
 
-    for image, trimap, _ in train_pbar:
+    global _train_batch_step
 
-        image  = image.to(DEVICE)
-        trimap = trimap.to(DEVICE)
+    for image, mask, _ in train_pbar:
 
-        output     = model(image)
-        loss_value = loss(output, trimap)
+        image = image.to(DEVICE)
+        mask = mask.to(DEVICE)
 
-        training_loss += loss_value.item()
+        with _forward_autocast():
+            output = model(image)
+            loss_value = loss(output, mask)
+
+        loss_sum += loss_value.item()
         optimizer.zero_grad(set_to_none=True)
         loss_value.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = 1.0)
         optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
-
-        train_pbar.set_postfix({'loss': f"{loss_value.item():.6f}"})
-
-    return training_loss / len(train_dataloader)
+        if not use_swa and _train_batch_step < ONECYCLE_TOTAL_STEPS:
+            onecycle_scheduler.step()
+        _train_batch_step += 1
         
-def validate_one_epoch(
-    model: UNet,
-    val_dataset: OxfordPetDataset,
-) -> tuple[float, float]:
-    """Validate with full-image inference: resize → normalize → pad → model → upsample.
+        soft_dice_sum += dice_sum_batch(output, mask, soft = True)
+        lr_display = optimizer.param_groups[0]["lr"]
+        train_pbar.set_postfix({'lr': f"{lr_display:.4g}"})
 
-    The image is resized to ``TARGET_SIZE``, padded by 92 px on all sides
-    (matching the training input convention), passed through the model, then
-    bilinearly upsampled back to the original resolution for loss and Dice
-    computation.
+    mean_loss = loss_sum / n_batches
+    mean_soft_dice = soft_dice_sum / n_samples
 
-    Args:
-        model: Trained UNet model.
-        val_dataset: Validation dataset (``is_train=False``).
+    return mean_loss, mean_soft_dice
 
-    Returns:
-        Tuple of (mean_val_loss, mean_dice_score).
-    """
+
+def validate_one_epoch(model, loss, val_dataloader) -> tuple[float, float]:
+    
     model.eval()
     validation_loss  = 0.0
     epoch_dice_score = 0.0
 
     with torch.no_grad():
-        val_pbar = tqdm(range(len(val_dataset)), desc="Validation")
-        for idx in val_pbar:
-            # dataset[idx] returns (normalized_tensor [3,H,W], trimap, idx)
-            img_normalized, _, _ = val_dataset[idx]
+    
+        loss_sum = 0.0
+        soft_dice_sum = 0.0
+        n_batches = len(val_dataloader)
+        n_samples = len(val_dataloader.dataset)
+        val_pbar = tqdm(val_dataloader, desc = "Validation", leave = False)
+    
+        for image, mask, _ in val_pbar:
+            
+            image = image.to(DEVICE)
+            mask = mask.to(DEVICE)
+            with _forward_autocast():
+                output = model(image)
+                loss_value = loss(output, mask)
+            loss_sum += loss_value.item()
+            
+            soft_dice_sum += dice_sum_batch(output, mask, soft = True)
+            lr_display = optimizer.param_groups[0]["lr"]
+            val_pbar.set_postfix({'lr': f"{lr_display:.4g}"})
+        
+    mean_loss = loss_sum / n_batches
+    mean_soft_dice = soft_dice_sum / n_samples
 
-            stitched = predict_full_image(
-                lambda b: torch.softmax(model(b.to(DEVICE)), dim=1),
-                img_normalized,
-            )  # [2, H_orig, W_orig]
+    return mean_loss, mean_soft_dice
 
-            trimap_np = (np.array(val_dataset.load_trimap(idx)) == 1).astype(np.uint8)
-            trimap_t  = torch.from_numpy(trimap_np).long()
-
-            log_probs  = torch.log(stitched.clamp(min=1e-8))
-            loss_value = F.nll_loss(log_probs.unsqueeze(0), trimap_t.unsqueeze(0))
-            validation_loss += loss_value.item()
-
-            pred = torch.argmax(stitched, dim=0).float()
-            epoch_dice_score += dice_score(pred, trimap_t.float())
-
-            val_pbar.set_postfix({"loss": f"{loss_value.item():.6f}"})
-
-    return validation_loss / len(val_dataset), epoch_dice_score / len(val_dataset)
 
 if __name__ == "__main__":
     
@@ -161,187 +231,107 @@ if __name__ == "__main__":
     elif MODEL_NAME == "ResNet34_UNet":
         model  = torch.compile(ResNet34UNet().to(DEVICE))
 
+    torch.cuda.empty_cache()
+
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    _model_slug   = MODEL_NAME.lower()
-    save_dir      = os.path.join("saved_models", _model_slug, run_timestamp)
+    save_dir      = os.path.join("saved_models", MODEL_NAME, run_timestamp)
     os.makedirs(save_dir, exist_ok = True)
-    p1_best_model_path = os.path.join(save_dir, f"{_model_slug}_p1.pth")
-    p2_best_model_path = os.path.join(save_dir, f"{_model_slug}_p2.pth")
+    best_model_path = os.path.join(save_dir, f"{MODEL_NAME}.pth")
 
-    print_training_config(
-        run_timestamp            = run_timestamp,
-        p1_best_model_path       = p1_best_model_path,
-        p2_best_model_path       = p2_best_model_path,
-        device                   = str(DEVICE),
-        model_name               = MODEL_NAME,
-        phase1_epochs            = P1_EPOCHS,
-        phase2_epochs            = P2_EPOCHS,
-        batch_size               = BATCH_SIZE,
-        learning_rate            = LEARNING_RATE,
-        weight_decay             = WEIGHT_DECAY,
-        dice_alpha               = DICE_WEIGHT,
-        lovasz_beta              = LOVASZ_WEIGHT,
-        p1_warmup_epochs         = P1_WARMUP_EPOCHS,
-        p2_warmup_epochs         = P2_WARMUP_EPOCHS,
-        p1_warmup_start_factor   = P1_WARMUP_START_FACTOR,
-        p2_warmup_start_factor   = P2_WARMUP_START_FACTOR,
-        p1_cosine_eta_min_factor = COSINE_ETA_MIN_FACTOR,
-        p2_cosine_eta_min_factor = COSINE_ETA_MIN_FACTOR,
-        patience_phase1          = P1_PATIENCE,
-        p2_lr_divisor            = P2_LR_DIVISOR,
-        patience_phase2          = P2_PATIENCE,
+    save_training_config(
+        save_dir        = save_dir,
+        run_timestamp   = run_timestamp,
+        best_model_path = best_model_path,
+        resize_map      = RESIZE_MAP[MODEL_NAME],
+        device          = str(DEVICE),
+        model_name      = MODEL_NAME,
+        num_epochs      = NUM_EPOCHS,
+        batch_size      = BATCH_SIZE,
+        learning_rate   = LEARNING_RATE,
+        weight_decay    = WEIGHT_DECAY,
+        weight_bce      = WEIGHT_BCE,
+        weight_dice     = WEIGHT_DICE,
+        weight_lovasz   = WEIGHT_LOVAZ,
+        onecycle_max_lr = ONECYCLE_MAX_LR,
+        onecycle_pct_start = ONECYCLE_PCT_START,
+        onecycle_div_factor = ONECYCLE_DIV_FACTOR,
+        onecycle_final_div_factor = ONECYCLE_FINAL_DIV_FACTOR,
+        onecycle_three_phase = ONECYCLE_THREE_PHASE,
+        swa_start_epoch = SWA_START_EPOCH,
+        swa_lr = SWA_LR,
+        swa_anneal_epochs = SWA_ANNEAL_EPOCHS,
+        patience        = PATIENCE,
+        use_bf16        = USE_BF16,
+        cudnn_benchmark = torch.cuda.is_available() and torch.backends.cudnn.benchmark,
     )
+    
+    train_losses:      list[float] = []
+    train_dice_scores: list[float] = []
+    val_losses:        list[float] = []
+    val_dice_scores:   list[float] = []
 
-    train_losses:    list[float] = []
-    val_losses:      list[float] = []
-    val_dice_scores: list[float] = []
+    best_validation_mean_soft_dice = 0.0
+    epochs_without_improvement = 0
+    swa_updates = 0
 
     try:
-        # ── Phase 1: Focal + Dice, linear warmup then constant LR ────────────
-        tqdm.write(f"\n── Phase 1: Focal(gamma = {FOCAL_GAMMA}) + Dice ({P1_EPOCHS} epochs, warmup {P1_WARMUP_EPOCHS} ep) ──")
+        for epoch in tqdm(range(NUM_EPOCHS)):
+            use_swa = (epoch + 1) >= SWA_START_EPOCH
 
-        steps_per_epoch = len(train_dataloader)
-
-        # Training settings
-        p1_lr = LEARNING_RATE
-        p1_loss = lambda output, target: combined_loss(output, target, alpha = DICE_WEIGHT, gamma = FOCAL_GAMMA)    
-        p1_optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            lr           = p1_lr, 
-            weight_decay = WEIGHT_DECAY,
-        )
-        
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            p1_optimizer,
-            start_factor = P1_WARMUP_START_FACTOR,
-            end_factor   = 1.0,
-            total_iters  = P1_WARMUP_EPOCHS * steps_per_epoch,
-        )
-        
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            p1_optimizer,
-            T_max   = (P1_EPOCHS - P1_WARMUP_EPOCHS) * steps_per_epoch,
-            eta_min = 1e-6, 
-        )
-        
-        p1_scheduler = torch.optim.lr_scheduler.SequentialLR(
-            p1_optimizer,
-            schedulers = [warmup_scheduler, cosine_scheduler],
-            milestones = [P1_WARMUP_EPOCHS * steps_per_epoch]
-        )
-
-        best_p1_dice = -1.0
-        p1_epochs_no_improve = 0
-
-        # Training loop
-        for epoch in tqdm(range(P1_EPOCHS), desc = "Phase 1"):
-
-            training_loss = train_one_epoch(model, p1_optimizer, p1_loss, train_dataloader,
-                                            scheduler=p1_scheduler)
-            validation_loss, epoch_dice_score = validate_one_epoch(model, val_dataset)
-
-            train_losses.append(training_loss)
-            val_losses.append(validation_loss)
-            val_dice_scores.append(epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score))
-
-            tqdm.write(
-                f"[P1] Epoch {epoch+1:2d}/{P1_EPOCHS} | "
-                f"Train Loss: {training_loss:.6f} | "
-                f"Val Loss: {validation_loss:.6f} | "
-                f"Val Dice: {epoch_dice_score:.6f}"
+            training_loss, training_mean_soft_dice = train_one_epoch(
+                model, optimizer, loss, train_dataloader, use_swa = use_swa
+            )
+            if use_swa:
+                swa_model.update_parameters(model)
+                swa_updates += 1
+                swa_scheduler.step()
+            validation_loss, validation_mean_soft_dice = validate_one_epoch(
+                model, loss, val_dataloader
             )
 
-
-            # Early stopping & checkpoint saving
-            if epoch_dice_score > best_p1_dice:
-                best_p1_dice         = epoch_dice_score
-                p1_epochs_no_improve = 0
-                torch.save(model.state_dict(), p1_best_model_path)
-                tqdm.write(f"  ↑ New best Dice: {best_p1_dice:.6f} — checkpoint saved")
-            else:
-                p1_epochs_no_improve += 1
-                if p1_epochs_no_improve >= P1_PATIENCE:
-                    tqdm.write(
-                        f"Early stopping at P1 epoch {epoch+1}. Best Dice: {best_p1_dice:.6f}"
-                    )
-                    break
-
-        tqdm.write(f"Phase 1 complete. Best Dice: {best_p1_dice:.6f}")
-
-        model.load_state_dict(torch.load(p1_best_model_path, weights_only=True))
-        tqdm.write(f"Loaded best Phase 1 weights → {p1_best_model_path}")
-
-        # ── Phase 2: Focal + Lovász, LR/10, CosineAnnealing, early stopping ───
-        tqdm.write(f"\n── Phase 2: Focal(gamma = {FOCAL_GAMMA}) + Lovász (max {P2_EPOCHS} epochs, CosineAnnealingLR) ──")
-
-        p2_lr = LEARNING_RATE / P2_LR_DIVISOR
-        p2_loss = lambda output, target: combined_loss_lovasz(output, target, beta = LOVASZ_WEIGHT, gamma = FOCAL_GAMMA)
-        p2_optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr           = p2_lr,
-            weight_decay = WEIGHT_DECAY / 20,
-        )
-        p2_warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            p2_optimizer,
-            start_factor = P2_WARMUP_START_FACTOR,
-            end_factor   = 1.0,
-            total_iters  = P2_WARMUP_EPOCHS * steps_per_epoch,
-        )
-
-        p2_cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            p2_optimizer,
-            T_max   = (P2_EPOCHS - P2_WARMUP_EPOCHS) * steps_per_epoch,
-            eta_min = p2_lr * COSINE_ETA_MIN_FACTOR,
-        )
-        
-        p2_scheduler = torch.optim.lr_scheduler.SequentialLR(
-            p2_optimizer,
-            schedulers = [p2_warmup_scheduler, p2_cosine_scheduler],
-            milestones = [P2_WARMUP_EPOCHS * steps_per_epoch]
-        )
-
-        best_p2_dice = -1.0
-        epochs_without_improve = 0
-
-        # Training loop
-        for epoch in tqdm(range(P2_EPOCHS), desc = "Phase 2"):
-
-            training_loss = train_one_epoch(model, p2_optimizer, p2_loss, train_dataloader,
-                                            scheduler=p2_scheduler)
-            validation_loss, epoch_dice_score = validate_one_epoch(model, val_dataset)
-
             train_losses.append(training_loss)
+            train_dice_scores.append(training_mean_soft_dice)
             val_losses.append(validation_loss)
-            val_dice_scores.append(epoch_dice_score.item() if hasattr(epoch_dice_score, "item") else float(epoch_dice_score))
+            val_dice_scores.append(validation_mean_soft_dice)
 
             tqdm.write(
-                f"[P2] Epoch {epoch+1:2d}/{P2_EPOCHS} | "
+                f"Epoch {epoch + 1:3d} |"
                 f"Train Loss: {training_loss:.6f} | "
+                f"Train Soft Dice: {training_mean_soft_dice:.6f} | "
                 f"Val Loss: {validation_loss:.6f} | "
-                f"Val Dice: {epoch_dice_score:.6f}"
+                f"Val Soft Dice: {validation_mean_soft_dice:.6f}"
             )
-            
-            # Early stopping & checkpoint saving
-            if epoch_dice_score > best_p2_dice:
-                best_p2_dice           = epoch_dice_score
-                epochs_without_improve = 0
-                torch.save(model.state_dict(), p2_best_model_path)
-                tqdm.write(f"  ↑ New best Dice: {best_p2_dice:.6f} — checkpoint saved")
+
+            if validation_mean_soft_dice > best_validation_mean_soft_dice:
+                best_validation_mean_soft_dice = validation_mean_soft_dice
+                epochs_without_improvement = 0
+                torch.save(model.state_dict(), best_model_path)
+                print(f"Best validation soft Dice: {best_validation_mean_soft_dice:.6f} → Saved best model → {os.path.basename(best_model_path)}")
             else:
-                epochs_without_improve += 1
-                if epochs_without_improve >= P2_PATIENCE:
-                    tqdm.write(
-                        f"Early stopping at P2 epoch {epoch+1}. "
-                        f"Best Dice: {best_p2_dice:.6f}"
-                    )
-                    break
+                if use_swa:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= PATIENCE:
+                        tqdm.write(
+                            f"Early stopping at epoch {epoch+1}. Best val mean soft Dice: "
+                            f"{best_validation_mean_soft_dice:.6f}"
+                        )
+                        break
 
     finally:
         # Plot training curves
         if train_losses:
-            plot_training_curves(
-                train_losses    = train_losses,
-                val_losses      = val_losses,
-                val_dice_scores = val_dice_scores,
-                save_dir        = save_dir,
+            if swa_updates > 0:
+                if MODEL_NAME == "ResNet34UNet":  # Recompute BN running stats before exporting SWA model.
+                    update_bn(train_dataloader, swa_model, device = DEVICE)
+
+                swa_model_path = os.path.join(save_dir, f"{MODEL_NAME}_swa.pth")
+                torch.save(swa_model.module.state_dict(), swa_model_path)
+                tqdm.write(f"Saved SWA model → {os.path.basename(swa_model_path)}")
+
+            save_training_results(
+                train_losses      = train_losses,
+                train_dice_scores = train_dice_scores,
+                val_losses        = val_losses,
+                val_dice_scores   = val_dice_scores,
+                save_dir          = save_dir,
             )

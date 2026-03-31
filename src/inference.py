@@ -1,323 +1,263 @@
-import os
-import csv
-import torch
-import numpy as np
-import torchvision.transforms.functional as TF
+from __future__ import annotations
 
-from PIL import Image
+import csv
+import os
+import numpy as np
+import torch
+import torch.nn.functional as F
+
 from tqdm import tqdm
-from scipy import ndimage
-from skimage import morphology
+from typing import Union
+
+from torch.utils.data import DataLoader
 
 from src.models.unet import UNet
-from src.evaluate import dice_score
-from src.oxford_pet import OxfordPetDataset, IMAGENET_MEAN, IMAGENET_STD
-from src.utils import prepare_five_crops, predict_full_image, rle_encode, stitch_five_crop_results
+from src.utils import rle_encode
+from src.oxford_pet import OxfordPetDataset
+from src.models.resnet34_unet import ResNet34UNet
 
-TIMESTAMP      = "20260323-064056"
-BATCH_SIZE     = 16
-DATASET_ROOT   = "dataset/oxford-iiit-pet"
-VAL_SPLIT      = "val.txt"
-TEST_SPLIT     = "test_unet.txt"
-THRESHOLD_MIN  = 0.30
-THRESHOLD_MAX  = 0.70
-THRESHOLD_STEP = 0.05
+# ---------------------------------------------------------------------
+# Independent utility block (safe to delete later)
+# ---------------------------------------------------------------------
+def dice_scores_from_probs(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+    eps: float = 1e-7,
+) -> tuple[torch.Tensor, torch.Tensor]:
 
-NUM_WORKERS = 6
+    # Normalize shapes to (N, H, W)
+    if probs.ndim == 2:
+        probs_nhw = probs.unsqueeze(0)
+    elif probs.ndim == 3:
+        probs_nhw = probs
+    else:
+        # (N, 1, H, W) -> (N, H, W)
+        if probs.shape[1] != 1:
+            raise ValueError(f"Expected probs shape (N,1,H,W) for 4D input, got {tuple(probs.shape)}")
+        probs_nhw = probs.squeeze(1)
+
+    if targets.ndim == 2:
+        targets_nhw = targets.unsqueeze(0)
+    elif targets.ndim == 3:
+        targets_nhw = targets
+    else:
+        if targets.shape[1] != 1:
+            raise ValueError(
+                f"Expected targets shape (N,1,H,W) for 4D input, got {tuple(targets.shape)}"
+            )
+        targets_nhw = targets.squeeze(1)
+
+    if probs_nhw.shape != targets_nhw.shape:
+        raise ValueError(
+            f"probs and targets shapes must match after squeezing, got probs={tuple(probs_nhw.shape)} "
+            f"targets={tuple(targets_nhw.shape)}"
+        )
+
+    probs_f = probs_nhw.to(dtype=torch.float32)
+    targets_f = targets_nhw.to(dtype=torch.float32)
+
+    reduce_dims = (1, 2)  # sum over H, W
+    intersection_soft = (probs_f * targets_f).sum(dim=reduce_dims)
+    union_soft = probs_f.sum(dim=reduce_dims) + targets_f.sum(dim=reduce_dims)
+    soft_dice = (2.0 * intersection_soft + eps) / (union_soft + eps)
+
+    preds_f = (probs_f >= float(threshold)).to(dtype=torch.float32)
+    intersection_hard = (preds_f * targets_f).sum(dim=reduce_dims)
+    union_hard = preds_f.sum(dim=reduce_dims) + targets_f.sum(dim=reduce_dims)
+    hard_dice = (2.0 * intersection_hard + eps) / (union_hard + eps)
+
+    return soft_dice, hard_dice
+
+# MODEL_NAME = "UNet"
+# TIMESTAMP = "20260327-110204"
+
+MODEL_NAME = "ResNet34UNet"
+TIMESTAMP = "20260327-144436"
+
+BATCH_SIZE = 32
+DATASET_ROOT = "dataset/oxford-iiit-pet"
+NUM_WORKERS = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+RESIZE_MAP = {
+    "UNet": {
+        "IMAGE_SIZE": (572, 572),
+        "MASK_SIZE": (572 - 184, 572 - 184),
+    },
+    "ResNet34UNet": {
+        "IMAGE_SIZE": (512, 512),
+        "MASK_SIZE": (512, 512),
+    }
+}
 
+if MODEL_NAME == "UNet":
+    TEST_SPLIT = "test_unet.txt"
+elif MODEL_NAME == "ResNet34UNet":
+    TEST_SPLIT = "test_res_unet.txt"
+else:
+    raise ValueError(f"Invalid model name: {MODEL_NAME}")
 
-def load_model(model_path: str, device: torch.device) -> UNet:
-    """Load a UNet checkpoint and set it to eval mode.
+def load_model(model_path: str, device: torch.device) -> Union[UNet, ResNet34UNet]:
 
-    Args:
-        model_path: Path to the `.pth` checkpoint file.
-        device: Target device.
-
-    Returns:
-        Loaded UNet model in eval mode.
-
-    Raises:
-        FileNotFoundError: If the checkpoint file does not exist.
-    """
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Checkpoint not found: {model_path}")
-
-    raw_state = torch.load(model_path, map_location=device, weights_only=True)
+    raw_state = torch.load(model_path, map_location = device, weights_only = True)
     state_dict = {k.removeprefix("_orig_mod."): v for k, v in raw_state.items()}
 
-    model = UNet().to(device)
+    if MODEL_NAME == "UNet":
+        model = UNet().to(device)
+    elif MODEL_NAME == "ResNet34UNet":
+        model = ResNet34UNet().to(device)
+    else:
+        raise ValueError(f"Invalid model name: {MODEL_NAME}")
+
     model.load_state_dict(state_dict)
     model.eval()
     return model
 
+def resize_prob_to_original(prob: np.ndarray, height: int, width: int) -> np.ndarray:
 
-_TTA_JITTER = (1.0, 1.2, 0.8)
-
-
-def _jitter(x: torch.Tensor, factor: float) -> torch.Tensor:
-    if factor == 1.0:
-        return x
-    return TF.adjust_contrast(TF.adjust_brightness(x, factor), factor)
-
+    t = torch.from_numpy(prob.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    out = F.interpolate(t, size = (height, width), mode = "bilinear", align_corners = False)
+    return out.squeeze(0).squeeze(0).numpy()
 
 @torch.no_grad()
-def tta_predict(model: UNet, image_batch: torch.Tensor) -> torch.Tensor:
-    """6-pass TTA: identity + hflip for each of 3 brightness/contrast jitters.
-
-    Args:
-        model: Trained UNet model.
-        image_batch: Input batch tensor.
-
-    Returns:
-        Averaged softmax probability tensor.
-    """
-    def fwd(x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(model(x), dim = 1)
-
-    probs = []
-    for jf in _TTA_JITTER:
-        img = _jitter(image_batch, jf)
-        probs.append(fwd(img))
-        probs.append(TF.hflip(fwd(TF.hflip(img))))
-
-    return torch.stack(probs).mean(dim = 0)
-
-
-
-def collect_probs(
-    model: UNet,
+def collect_sigmoid_probs(
+    model: Union[UNet, ResNet34UNet],
     dataset: OxfordPetDataset,
-    desc: str = "Collecting probs",
-) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
-    """Run TTA inference over a dataset and collect per-image fg probabilities.
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    desc: str,
+) -> tuple[list[np.ndarray], list[int]]:
 
-    For each image, two predictions are averaged 1:1:
-
-    * **Five-crop** — five overlapping 388×388 crops stitched back to the
-      original resolution via :func:`~src.utils.stitch_five_crop_results`.
-    * **Full-image** — the whole image resized to 388×388, fed through the
-      model, then upsampled back to the original resolution.
-
-    Args:
-        model: Trained UNet model.
-        dataset: Dataset to iterate over.
-        desc: tqdm progress bar label.
-
-    Returns:
-        Tuple of (fg_probs, targets, dataset_indices).
-    """
-    all_probs, all_targets, all_idxs = [], [], []
-
-    for idx in tqdm(range(len(dataset)), desc=desc):
-        # dataset[idx] applies to_tensor + ImageNet normalize (is_train=False path)
-        img_normalized, trimap_t, _ = dataset[idx]
-        H_orig, W_orig = img_normalized.shape[1], img_normalized.shape[2]
-
-        # Five-crop path: build crops from raw PIL, then normalize the batch
-        pil_image = dataset.load_image(idx).convert("RGB")
-        batch, positions, H_p, W_p, pad_top, pad_left, _, _ = prepare_five_crops(pil_image)
-        batch = TF.normalize(batch, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-
-        five_crop_probs = tta_predict(model, batch.to(DEVICE)).cpu()
-        stitched = stitch_five_crop_results(five_crop_probs, positions, H_p, W_p, pad_top, pad_left, H_orig, W_orig)
-
-        # Full-image path: reuse the already-normalised tensor from dataset[idx]
-        full_probs = predict_full_image(
-            lambda b: tta_predict(model, b.to(DEVICE)),
-            img_normalized,
-        )
-
-        # 1:1 weighted average of five-crop and full-image predictions
-        combined = (stitched + full_probs) * 0.5
-
-        trimap_np = np.array(dataset.load_trimap(idx))
-        all_probs.append(combined[1].numpy().astype(np.float32))
-        all_targets.append((trimap_np == 1).astype(np.uint8))
-        all_idxs.append(idx)
-
-    return all_probs, all_targets, all_idxs
+    loader = DataLoader(
+        dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        num_workers = num_workers,
+        pin_memory = True,
+        persistent_workers = True
+    )
+    all_probs: list[np.ndarray] = []
+    all_idx: list[int] = []
+    
+    for images, _, idxs in tqdm(loader, desc = desc, leave = False):
+        
+        images = images.to(device)
+        logits = model(images)
+        probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
+        
+        for i in range(probs.shape[0]):
+            
+            all_probs.append(probs[i])
+            all_idx.append(int(idxs[i].item() if torch.is_tensor(idxs[i]) else idxs[i]))
+            
+    return all_probs, all_idx
 
 
-def find_optimal_threshold(
-    all_probs: list[np.ndarray],
-    all_targets: list[np.ndarray],
-    thresholds: np.ndarray,
-) -> tuple[float, float]:
-    """Grid-search the threshold that maximises mean Dice on a validation set.
-
-    Args:
-        all_probs: Per-image foreground probability maps.
-        all_targets: Per-image binary ground-truth masks.
-        thresholds: 1-D array of candidate threshold values.
-
-    Returns:
-        Tuple of (best_threshold, best_mean_dice).
-    """
-    best_thresh = float(thresholds[len(thresholds) // 2])
-    best_dice   = -1.0
-
-    for t in tqdm(thresholds, desc="Threshold search", leave=False, unit="t"):
-        mean_dice = np.mean([
-            2.0 * np.sum((p > t) * tgt) / (np.sum(p > t) + np.sum(tgt) + 1e-8)
-            for p, tgt in zip(all_probs, all_targets)
-        ])
-        if mean_dice > best_dice:
-            best_dice, best_thresh = float(mean_dice), float(t)
-
-    return best_thresh, best_dice
-
-
-def _apply_postprocess(mask: np.ndarray) -> np.ndarray:
-    """Remove small objects and fill holes in a binary mask."""
-    mask = morphology.remove_small_objects(mask, max_size = 499)
-    mask = ndimage.binary_fill_holes(mask).astype(np.uint8)
-    return mask
-
-def run_val(
-    model: UNet,
-    dataset_root: str,
-    val_split: str,
-    threshold_min: float = THRESHOLD_MIN,
-    threshold_max: float = THRESHOLD_MAX,
-    threshold_step: float = THRESHOLD_STEP,
-) -> tuple[float, float, list[np.ndarray], list[np.ndarray], list[int], OxfordPetDataset]:
-    """Validate with TTA: find optimal threshold and compute Dice on the val set.
-
-    Args:
-        model: Trained UNet model.
-        dataset_root: Root directory of the dataset.
-        val_split: Filename of the validation split list.
-        threshold_min: Lower bound for threshold search.
-        threshold_max: Upper bound for threshold search.
-        threshold_step: Step size for threshold search.
-
-    Returns:
-        Tuple of (best_thresh, val_dice, probs, targets, idxs, dataset).
-    """
-    dataset    = OxfordPetDataset(root=dataset_root, split_file=val_split, is_train=False)
-    thresholds = np.arange(threshold_min, threshold_max + 1e-9, threshold_step)
-
-    all_probs, all_targets, all_idxs = collect_probs(model, dataset, desc="Val (TTA)")
-    best_thresh, _ = find_optimal_threshold(all_probs, all_targets, thresholds)
-
-    per_dice = [
-        float(dice_score(
-            torch.from_numpy(_apply_postprocess(p > best_thresh).astype(np.float32)),
-            torch.from_numpy(t.astype(np.float32)),
-        ))
-        for p, t in zip(all_probs, all_targets)
-    ]
-    val_dice = float(np.mean(per_dice))
-
-    W = 44
-    print(f"\n{'─'*W}")
-    print(" Validation — TTA (6-pass)".center(W))
-    print(f"{'─'*W}")
-    print(f"  Threshold : {best_thresh:.2f}")
-    print(f"  Val Dice  : {val_dice:.6f}")
-    print(f"{'─'*W}")
-
-    return best_thresh, val_dice, all_probs, all_targets, all_idxs, dataset
-
-
-def generate_submission(
-    model: UNet,
+def write_submission_csv(
+    model: Union[UNet, ResNet34UNet],
+    model_name: str,
     dataset_root: str,
     test_split: str,
-    best_thresh: float,
     save_dir: str,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    csv_name: str,
 ) -> str:
-    """Run TTA inference on the test set and write a submission CSV.
 
-    Args:
-        model: Trained UNet model.
-        dataset_root: Root directory of the dataset.
-        test_split: Filename of the test split list.
-        best_thresh: Binarisation threshold (from validation).
-        save_dir: Directory to write ``submission.csv`` into.
+    os.makedirs(save_dir, exist_ok=True)
+    test_ds = OxfordPetDataset(root       = dataset_root, 
+                               split_file = test_split, 
+                               is_train   = False, 
+                               model_name = model_name,
+                               resize_map = RESIZE_MAP
+                               )
+    
+    probs, idxs = collect_sigmoid_probs(
+        model, test_ds, device, batch_size, num_workers, desc="Test forward"
+    )
 
-    Returns:
-        Path to the written CSV file.
-    """
-    dataset = OxfordPetDataset(root=dataset_root, split_file=test_split, is_train=False)
-    all_probs, _, all_idxs = collect_probs(model, dataset, desc="Test (TTA)")
+    rows: list[dict[str, str]] = []
+    for prob, idx in tqdm(
+        list(zip(probs, idxs)), total=len(idxs), desc="Resize & RLE"
+    ):
+        w, h = test_ds.load_image(idx).size
+        prob_hw = resize_prob_to_original(prob, h, w)
+        binary = (prob_hw > 0.5).astype(np.uint8)
+        image_id = test_ds.image_list[idx].stem
+        rows.append(
+            {
+                "image_id": image_id,
+                "encoded_mask": rle_encode(binary),
+            }
+        )
 
-    rows = [
-        {
-            "image_id": dataset.image_list[idx].stem,
-            "encoded_mask": rle_encode(_apply_postprocess(fg_prob > best_thresh)),
-        }
-        for fg_prob, idx in tqdm(zip(all_probs, all_idxs), total=len(all_probs), desc="Binarize & RLE")
-    ]
-
-    csv_path = os.path.join(save_dir, "submission.csv")
-    with open(csv_path, "w", newline = "") as f:
-        writer = csv.DictWriter(f, fieldnames = ["image_id", "encoded_mask"])
+    csv_path = os.path.join(save_dir, csv_name)
+    with open(csv_path, "w", newline = "", encoding = "utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["image_id", "encoded_mask"])
         writer.writeheader()
         writer.writerows(rows)
 
+    print(f"Wrote {csv_path} ({len(rows)} rows)")
     return csv_path
 
 
-def plot_worst_predictions(
-    probs: list[np.ndarray],
-    per_dice: list[float],
-    idxs: list[int],
-    thresh: float,
-    dataset: OxfordPetDataset,
-    save_dir: str,
-    n: int = 3,
-) -> None:
-    """Save visualisations of the n worst-Dice predictions.
-
-    Args:
-        probs: Per-image foreground probability maps.
-        per_dice: Per-image Dice scores.
-        idxs: Dataset indices corresponding to each entry in *probs*.
-        thresh: Binarisation threshold.
-        dataset: Dataset used for loading images.
-        save_dir: Directory to write the PNG files into.
-        n: Number of worst samples to visualise.
-    """
-    from src.utils import plot_sample
-
-    for rank, i in enumerate(sorted(range(len(per_dice)), key=lambda i: per_dice[i])[:n], start=1):
-        int_idx  = idxs[i]
-        image_np = np.array(dataset.load_image(int_idx).convert("L"), dtype=np.float32) / 255.0
-        pred_mask = (probs[i] > thresh).astype(np.uint8)
-        plot_sample(
-            image_np,
-            pred_mask,
-            title = f"Worst {rank} — Dice: {per_dice[i]:.6f}",
-            mask_title = "Predicted Mask",
-            save_path = os.path.join(save_dir, f"worst_{rank}.png"),
-        )
-
-
 if __name__ == "__main__":
-    
-    save_dir = os.path.join("saved_models", "unet", TIMESTAMP)
-    ckpt     = os.path.join(save_dir, "unet_p2.pth")
+
+    # Print Dice on your test split (two numbers: soft/hard).
+    save_dir = os.path.join("saved_models", MODEL_NAME, TIMESTAMP)
+    ckpt = os.path.join(save_dir, f"{MODEL_NAME}.pth")
 
     if not os.path.exists(ckpt):
-        raise SystemExit(f"Checkpoint not found: {ckpt}  — update TIMESTAMP")
+        raise SystemExit(f"Checkpoint not found: {ckpt} — update TIMESTAMP or path")
 
     model = load_model(ckpt, DEVICE)
     print(f"Checkpoint : {ckpt}")
-    print(f"Device     : {DEVICE}")
 
-    best_thresh, val_dice, probs, targets, idxs, val_dataset = run_val(model, DATASET_ROOT, VAL_SPLIT)
+    test_ds = OxfordPetDataset(
+        root       = DATASET_ROOT,
+        split_file = TEST_SPLIT,
+        is_train   = False,
+        model_name = MODEL_NAME,
+        resize_map = RESIZE_MAP
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size         = BATCH_SIZE,
+        shuffle            = False,
+        num_workers        = NUM_WORKERS,
+        pin_memory         = True,
+        persistent_workers = True,
+    )
 
-    per_dice = [
-        float(dice_score(
-            torch.from_numpy(_apply_postprocess(p > best_thresh).astype(np.float32)),
-            torch.from_numpy(t.astype(np.float32)),
-        ))
-        for p, t in zip(probs, targets)
-    ]
-    plot_worst_predictions(probs, per_dice, idxs, best_thresh, val_dataset, save_dir)
+    soft_sum = 0.0
+    hard_sum = 0.0
+    n = 0
+    with torch.no_grad():
+        for images, masks, _ in tqdm(test_loader, desc = "Test Dice", leave = False):
+            images = images.to(DEVICE)
+            masks = masks.to(DEVICE)
+            probs = torch.sigmoid(model(images))
+            soft, hard = dice_scores_from_probs(probs, masks, threshold=0.5)
+            soft_sum += float(soft.sum().item())
+            hard_sum += float(hard.sum().item())
+            n += int(soft.numel())
 
-    # csv_path = generate_submission(model, DATASET_ROOT, TEST_SPLIT, best_thresh, save_dir)
-    # print(f"\nSubmission saved → {csv_path}")
+    print(f"Soft Dice: {soft_sum / max(n, 1):.6f}")
+    print(f"Hard Dice: {hard_sum / max(n, 1):.6f}")
+
+    write_submission_csv(
+        model        = model,
+        model_name   = MODEL_NAME,
+        dataset_root = DATASET_ROOT,
+        test_split   = TEST_SPLIT,
+        save_dir     = save_dir,
+        device       = DEVICE,
+        batch_size   = BATCH_SIZE,
+        num_workers  = NUM_WORKERS,
+        csv_name     = f"submission_{MODEL_NAME}.csv"
+    )
+    

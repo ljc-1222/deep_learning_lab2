@@ -1,99 +1,181 @@
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Union
 
-import numpy as np
+import cv2
 import torch
+import numpy as np
+import albumentations as A
 import torchvision.transforms.functional as F
 
 from PIL import Image
-from torchvision import transforms
+from tqdm import tqdm
 from torch.utils.data import Dataset
+from albumentations.pytorch import ToTensorV2
 
-TARGET_SIZE:    Tuple[int, int] = (388, 388)
-IMAGENET_MEAN: list[float]     = [0.485, 0.456, 0.406]
-IMAGENET_STD:  list[float]     = [0.229, 0.224, 0.225]
 
-def _random_resized_crop_pair(
-    image: Image.Image,
-    trimap: Image.Image,
-    target_size: Tuple[int, int],
-    scale: Tuple[float, float] = (0.2, 1.0),
-    ratio: Tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0),
-) -> Tuple[Image.Image, Image.Image]:
-    """Apply the same random resized crop to RGB image and trimap."""
-    i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=scale, ratio=ratio)
+def train_transform() -> A.Compose:
 
-    image = F.crop(image, i, j, h, w)
-    trimap = F.crop(trimap, i, j, h, w)
+    return A.Compose(
+        [
+            A.HorizontalFlip(p = 0.5),
+            A.SafeRotate(limit = 20, p = 0.5),
+            A.Sharpen(alpha = (0.2, 0.5), lightness = (0.5, 1.0), p = 0.5),
+            A.Blur(blur_limit = (3, 5), p = 0.5),
+            A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
+                        std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
+            ToTensorV2(),
+        ],
+    )
 
-    image = F.resize(image, target_size, interpolation=F.InterpolationMode.BILINEAR)
-    trimap = F.resize(trimap, target_size, interpolation=F.InterpolationMode.NEAREST)
 
-    return image, trimap
+def eval_transform() -> A.Compose:
 
+    return A.Compose(
+        [
+            A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
+                        std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
+            ToTensorV2(),
+        ],
+    )
+    
+def apply_clahe_rgb(image: np.ndarray) -> np.ndarray:
+
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    # Apply CLAHE only on the L channel in LAB space.
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    
+    clahe = cv2.createCLAHE(clipLimit = 2.0, tileGridSize = (8, 8))
+    l_channel = clahe.apply(l_channel)
+    
+    lab = cv2.merge((l_channel, a_channel, b_channel))
+    rgb_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    
+    return rgb_enhanced
 
 class OxfordPetDataset(Dataset):
-    def __init__(self, root, split_file, transform=None, is_train=False):
+
+    def __init__(
+        self,
+        root: Union[str, Path],
+        split_file: Union[str, Path],
+        is_train: bool = False,
+        model_name: str = "UNet",
+        resize_map: dict = None,
+    ) -> None:
+        
         self.root = Path(root)
         self.split_file = self.root / split_file
         self.is_train = is_train
+        self.transform = train_transform() if is_train else eval_transform()
+        self.model_name = model_name
+        self.resize_map = resize_map
         
-        with open(self.split_file, "r") as f:
+        with open(self.split_file, "r", encoding = "utf-8") as f:
             sample_ids = [line.strip() for line in f if line.strip()]
 
-        self.image_list = [self.root / "images" / f"{sample_id}.jpg" for sample_id in sample_ids]
-        self.trimap_list = [self.root / "annotations" / "trimaps" / f"{sample_id}.png" for sample_id in sample_ids]
-        self.transform = transform
+        self.image_list = [
+            self.root / "images" / f"{sample_id}.jpg" for sample_id in sample_ids
+        ]
+        self.trimap_list = [
+            self.root / "annotations" / "trimaps" / f"{sample_id}.png"
+            for sample_id in sample_ids
+        ]
+
+    def __len__(self) -> int:
         
-    def __len__(self):
         return len(self.image_list)
-    
-    def load_trimap(self, idx):
+
+    def load_trimap(self, idx: int) -> Image.Image:
+
         return Image.open(self.trimap_list[idx])
-    
-    def load_image(self, idx):
+
+    def load_image(self, idx: int) -> Image.Image:
+
         return Image.open(self.image_list[idx])
-    
-    def __getitem__(self, idx):
-        image = self.load_image(idx).convert("RGB")
-        trimap = self.load_trimap(idx)
 
-        if self.is_train:
-            image, trimap = _random_resized_crop_pair(image, trimap, TARGET_SIZE)
+    @staticmethod
+    def _trimap_to_binary_mask(trimap: np.ndarray) -> np.ndarray:
+        
+        return (trimap == 1).astype(np.float32)
 
-            if torch.rand(1).item() < 0.5:
-                image = F.hflip(image)
-                trimap = F.hflip(trimap)
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
 
-            if torch.rand(1).item() < 0.5:
-                jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2)
-                image = jitter(image)
+        image = np.array(self.load_image(idx).convert("RGB"))
+        trimap = np.array(self.load_trimap(idx))
+        mask = self._trimap_to_binary_mask(trimap)
+
+        image = apply_clahe_rgb(image)
+        transformed = self.transform(image = image, mask = mask)
+        image_t = transformed["image"]
+        mask_t = transformed["mask"].unsqueeze(0)
+        
+        image_t = F.resize(image_t, 
+                           size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                           interpolation = F.InterpolationMode.BILINEAR
+                           )
+        
+        # Pad the image to IMAGE_SIZE if model is UNet
+        if self.model_name == "UNet":
+            image_t = F.pad(image_t, 
+                            padding = 92,
+                            padding_mode = "constant"
+                            )
             
-            image = F.pad(image, padding=92, fill=0, padding_mode="reflect")
+        mask_t = F.resize(mask_t, 
+                          size = (self.resize_map[self.model_name]["MASK_SIZE"]), 
+                          interpolation = F.InterpolationMode.NEAREST
+                          )
 
-        image = F.to_tensor(image)
-        image = F.normalize(image, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-
-        trimap = np.array(trimap)
-        trimap = (trimap == 1).astype(np.uint8)
-        trimap = torch.from_numpy(trimap).long()
+        return image_t, mask_t, idx
 
         return image, trimap, idx
 
-    
 if __name__ == "__main__":
+    
+    import matplotlib.pyplot as plt
 
-    from src.utils import plot_sample
-
-    dataset = OxfordPetDataset(root="dataset/oxford-iiit-pet", split_file="train.txt", is_train=False)
+    dataset = OxfordPetDataset(
+        root = "dataset/oxford-iiit-pet",
+        split_file = "train.txt",
+        is_train = False,
+        model_name = "UNet",
+        resize_map = {
+            "UNet": {
+                "IMAGE_SIZE": (396, 396),
+                "MASK_SIZE": (396 - 184, 396 - 184),
+            },
+            "ResNet34UNet": {
+                "IMAGE_SIZE": (256, 256),
+                "MASK_SIZE": (256, 256),
+            }
+        }
+    )
+    
     image, trimap, idx = dataset[0]
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    vis = (image * std + mean).clamp(0.0, 1.0).permute(1, 2, 0).numpy()
 
     size = dataset.load_image(idx).size[::-1]
 
-    image = image[:, 92:-92, 92:-92].float()
-    image = F.resize(image, size=size).permute(1, 2, 0).numpy()  # H×W×3 for plot_sample
-    trimap = F.resize(trimap.unsqueeze(0).float(), size=size, interpolation=F.InterpolationMode.NEAREST).squeeze(0)
+    image_up = F.resize(torch.from_numpy(vis).permute(2, 0, 1), size = size)
+    trimap_up = F.resize(
+        trimap,
+        size = size,
+        interpolation = F.InterpolationMode.NEAREST,
+    ).squeeze(0)
 
-    plot_sample(image, trimap.numpy(), image_title="Image", mask_title="Trimap", save_path="sample.png")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    axes[0].imshow(image_up.permute(1, 2, 0).numpy())
+    axes[0].set_title("Image")
+    axes[0].axis("off")
+    axes[1].imshow(trimap_up.numpy(), cmap = "viridis", vmin = 0, vmax = 1)
+    axes[1].set_title("Mask")
+    axes[1].axis("off")
+    plt.tight_layout()
+    plt.show()
+

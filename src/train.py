@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import math
 import os
 import time
 from collections.abc import Callable
@@ -23,21 +24,21 @@ DEFAULT_DATASET_ROOT = "dataset/oxford-iiit-pet"
 DEFAULT_TRAIN_SPLIT_FILE = "train.txt"
 DEFAULT_VAL_SPLIT_FILE = "val.txt"
 DEFAULT_SEED = 42
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_NUM_EPOCHS = 500
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_NUM_EPOCHS = 250
 DEFAULT_WEIGHT_BCE = 0.1
 DEFAULT_WEIGHT_DICE = 0.9
-DEFAULT_WEIGHT_LOVASZ = 0.001
-DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_LEARNING_RATE = 1.5e-4
-DEFAULT_ONECYCLE_PCT_START = 0.45
-DEFAULT_ONECYCLE_DIV_FACTOR = 10.0
-DEFAULT_ONECYCLE_FINAL_DIV_FACTOR = 200.0
-DEFAULT_ONECYCLE_THREE_PHASE = True
-DEFAULT_SWA_START_EPOCH = 300
-DEFAULT_SWA_ANNEAL_EPOCHS = 20
-DEFAULT_PATIENCE = 50
-DEFAULT_NUM_WORKERS = min(8, os.cpu_count() or 1)
+DEFAULT_WEIGHT_LOVASZ = 0.005
+DEFAULT_WEIGHT_DECAY = 3e-4
+DEFAULT_LEARNING_RATE = 1 * 1e-4
+DEFAULT_WARMUP_EPOCH_RATIO = 0.08
+DEFAULT_WARMUP_START_FACTOR = 0.05
+DEFAULT_COSINE_MIN_FACTOR = 0.01
+DEFAULT_SWA_START_EPOCH = 135
+DEFAULT_SWA_LR = 5e-6
+DEFAULT_SWA_ANNEAL_EPOCHS = 10
+DEFAULT_PATIENCE = 30
+DEFAULT_NUM_WORKERS = min(6, os.cpu_count() or 1)
 UNET_SIZE = 388
 RESNET34_UNET_SIZE = 384
 RESIZE_MAP = {
@@ -65,25 +66,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-bce", type=float, default=DEFAULT_WEIGHT_BCE)
     parser.add_argument("--weight-dice", type=float, default=DEFAULT_WEIGHT_DICE)
     parser.add_argument("--weight-lovasz", type=float, default=DEFAULT_WEIGHT_LOVASZ)
-    parser.add_argument("--onecycle-max-lr", type=float, default=None)
-    parser.add_argument("--onecycle-pct-start", type=float, default=DEFAULT_ONECYCLE_PCT_START)
-    parser.add_argument("--onecycle-div-factor", type=float, default=DEFAULT_ONECYCLE_DIV_FACTOR)
     parser.add_argument(
-        "--onecycle-final-div-factor",
+        "--warmup-epoch-ratio",
         type=float,
-        default=DEFAULT_ONECYCLE_FINAL_DIV_FACTOR,
+        default=DEFAULT_WARMUP_EPOCH_RATIO,
     )
     parser.add_argument(
-        "--onecycle-three-phase",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_ONECYCLE_THREE_PHASE,
+        "--warmup-start-factor",
+        type=float,
+        default=DEFAULT_WARMUP_START_FACTOR,
+    )
+    parser.add_argument(
+        "--cosine-min-factor",
+        type=float,
+        default=DEFAULT_COSINE_MIN_FACTOR,
     )
     parser.add_argument("--swa-start-epoch", type=int, default=DEFAULT_SWA_START_EPOCH)
-    parser.add_argument("--swa-lr", type=float, default=None)
+    parser.add_argument("--swa-lr", type=float, default=DEFAULT_SWA_LR)
     parser.add_argument("--swa-anneal-epochs", type=int, default=DEFAULT_SWA_ANNEAL_EPOCHS)
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
-    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="cuda")
     return parser
 
 
@@ -104,7 +107,6 @@ def forward_autocast(device: torch.device, use_bf16: bool) -> contextlib.Abstrac
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
-
 def train_one_epoch(
     model: torch.nn.Module,
     optimizer: Optimizer,
@@ -112,8 +114,8 @@ def train_one_epoch(
     train_dataloader: DataLoader,
     device: torch.device,
     use_bf16: bool,
-    onecycle_scheduler: LRScheduler,
-    onecycle_total_steps: int,
+    lr_scheduler: LRScheduler,
+    scheduler_total_steps: int,
     train_batch_step: int,
     use_swa: bool = False,
 ) -> tuple[float, float, int]:
@@ -137,8 +139,8 @@ def train_one_epoch(
         loss_value.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if not use_swa and train_batch_step < onecycle_total_steps:
-            onecycle_scheduler.step()
+        if not use_swa and train_batch_step < scheduler_total_steps:
+            lr_scheduler.step()
         train_batch_step += 1
 
         soft_dice_sum += dice_sum_batch(output, mask, soft=True)
@@ -192,12 +194,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
 
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
-    onecycle_max_lr = (
-        args.onecycle_max_lr
-        if args.onecycle_max_lr is not None
-        else 10.0 * args.learning_rate
-    )
-    swa_lr = args.swa_lr if args.swa_lr is not None else args.learning_rate * 0.5
+    swa_lr = args.swa_lr
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -235,7 +232,8 @@ def main() -> None:
         persistent_workers=use_persistent_workers,
     )
 
-    onecycle_total_steps = args.swa_start_epoch * len(train_dataloader)
+    scheduler_total_steps = args.swa_start_epoch * len(train_dataloader)
+    warmup_steps = max(1, int(scheduler_total_steps * args.warmup_epoch_ratio))
 
     if args.model_name == "UNet":
         model = UNet().to(device)
@@ -244,6 +242,7 @@ def main() -> None:
     else:
         raise ValueError(f"Invalid model name: {args.model_name}")
 
+    torch._dynamo.config.capture_scalar_outputs = True
     model = torch.compile(model)
 
     loss_fn = lambda output, target: combined_loss(
@@ -264,14 +263,24 @@ def main() -> None:
         swa_lr=swa_lr,
         anneal_epochs=args.swa_anneal_epochs,
     )
-    onecycle_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    cosine_steps = max(1, scheduler_total_steps - warmup_steps)
+
+    def warmup_cosine_lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            if warmup_steps == 1:
+                return args.warmup_start_factor
+            warmup_progress = current_step / (warmup_steps - 1)
+            return args.warmup_start_factor + (1.0 - args.warmup_start_factor) * warmup_progress
+        if current_step >= scheduler_total_steps:
+            return args.cosine_min_factor
+        cosine_progress = (current_step - warmup_steps) / cosine_steps
+        cosine_progress = min(max(cosine_progress, 0.0), 1.0)
+        cosine_value = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+        return args.cosine_min_factor + (1.0 - args.cosine_min_factor) * cosine_value
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer=optimizer,
-        max_lr=onecycle_max_lr,
-        total_steps=onecycle_total_steps,
-        pct_start=args.onecycle_pct_start,
-        div_factor=args.onecycle_div_factor,
-        final_div_factor=args.onecycle_final_div_factor,
-        three_phase=args.onecycle_three_phase,
+        lr_lambda=warmup_cosine_lr_lambda,
     )
 
     if device.type == "cuda":
@@ -296,11 +305,9 @@ def main() -> None:
         weight_bce=args.weight_bce,
         weight_dice=args.weight_dice,
         weight_lovasz=args.weight_lovasz,
-        onecycle_max_lr=onecycle_max_lr,
-        onecycle_pct_start=args.onecycle_pct_start,
-        onecycle_div_factor=args.onecycle_div_factor,
-        onecycle_final_div_factor=args.onecycle_final_div_factor,
-        onecycle_three_phase=args.onecycle_three_phase,
+        warmup_epoch_ratio=args.warmup_epoch_ratio,
+        warmup_start_factor=args.warmup_start_factor,
+        cosine_min_factor=args.cosine_min_factor,
         swa_start_epoch=args.swa_start_epoch,
         swa_lr=swa_lr,
         swa_anneal_epochs=args.swa_anneal_epochs,
@@ -330,8 +337,8 @@ def main() -> None:
                 train_dataloader=train_dataloader,
                 device=device,
                 use_bf16=use_bf16,
-                onecycle_scheduler=onecycle_scheduler,
-                onecycle_total_steps=onecycle_total_steps,
+                lr_scheduler=lr_scheduler,
+                scheduler_total_steps=scheduler_total_steps,
                 train_batch_step=train_batch_step,
                 use_swa=use_swa,
             )

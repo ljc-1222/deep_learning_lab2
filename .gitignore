@@ -1,6 +1,3 @@
-# Model weights
-saved_models/
-
 # Virtual environment
 dl_lab2_venv/
 
@@ -8,6 +5,8 @@ dl_lab2_venv/
 __pycache__/
 *.pyc
 
+# Cursor
+.cursor/
+
 # Training results
 saved_models/
-

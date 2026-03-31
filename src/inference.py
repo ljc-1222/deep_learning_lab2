@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import numpy as np
@@ -16,65 +17,9 @@ from src.utils import rle_encode
 from src.oxford_pet import OxfordPetDataset
 from src.models.resnet34_unet import ResNet34UNet
 
-# ---------------------------------------------------------------------
-# Independent utility block (safe to delete later)
-# ---------------------------------------------------------------------
-def dice_scores_from_probs(
-    probs: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    threshold: float = 0.5,
-    eps: float = 1e-7,
-) -> tuple[torch.Tensor, torch.Tensor]:
-
-    # Normalize shapes to (N, H, W)
-    if probs.ndim == 2:
-        probs_nhw = probs.unsqueeze(0)
-    elif probs.ndim == 3:
-        probs_nhw = probs
-    else:
-        # (N, 1, H, W) -> (N, H, W)
-        if probs.shape[1] != 1:
-            raise ValueError(f"Expected probs shape (N,1,H,W) for 4D input, got {tuple(probs.shape)}")
-        probs_nhw = probs.squeeze(1)
-
-    if targets.ndim == 2:
-        targets_nhw = targets.unsqueeze(0)
-    elif targets.ndim == 3:
-        targets_nhw = targets
-    else:
-        if targets.shape[1] != 1:
-            raise ValueError(
-                f"Expected targets shape (N,1,H,W) for 4D input, got {tuple(targets.shape)}"
-            )
-        targets_nhw = targets.squeeze(1)
-
-    if probs_nhw.shape != targets_nhw.shape:
-        raise ValueError(
-            f"probs and targets shapes must match after squeezing, got probs={tuple(probs_nhw.shape)} "
-            f"targets={tuple(targets_nhw.shape)}"
-        )
-
-    probs_f = probs_nhw.to(dtype=torch.float32)
-    targets_f = targets_nhw.to(dtype=torch.float32)
-
-    reduce_dims = (1, 2)  # sum over H, W
-    intersection_soft = (probs_f * targets_f).sum(dim=reduce_dims)
-    union_soft = probs_f.sum(dim=reduce_dims) + targets_f.sum(dim=reduce_dims)
-    soft_dice = (2.0 * intersection_soft + eps) / (union_soft + eps)
-
-    preds_f = (probs_f >= float(threshold)).to(dtype=torch.float32)
-    intersection_hard = (preds_f * targets_f).sum(dim=reduce_dims)
-    union_hard = preds_f.sum(dim=reduce_dims) + targets_f.sum(dim=reduce_dims)
-    hard_dice = (2.0 * intersection_hard + eps) / (union_hard + eps)
-
-    return soft_dice, hard_dice
-
-# MODEL_NAME = "UNet"
-# TIMESTAMP = "20260327-110204"
-
-MODEL_NAME = "ResNet34UNet"
-TIMESTAMP = "20260327-144436"
+DEFAULT_MODEL_NAME = "ResNet34UNet"
+DEFAULT_TIMESTAMP = "20260331-094415"
+DEFAULT_USE_SWA = True
 
 BATCH_SIZE = 32
 DATASET_ROOT = "dataset/oxford-iiit-pet"
@@ -82,34 +27,56 @@ NUM_WORKERS = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 RESIZE_MAP = {
-    "UNet": {
-        "IMAGE_SIZE": (572, 572),
-        "MASK_SIZE": (572 - 184, 572 - 184),
-    },
-    "ResNet34UNet": {
-        "IMAGE_SIZE": (512, 512),
-        "MASK_SIZE": (512, 512),
-    }
+    "UNet": (388, 388),
+    "ResNet34UNet": (384, 384),
 }
 
-if MODEL_NAME == "UNet":
-    TEST_SPLIT = "test_unet.txt"
-elif MODEL_NAME == "ResNet34UNet":
-    TEST_SPLIT = "test_res_unet.txt"
-else:
-    raise ValueError(f"Invalid model name: {MODEL_NAME}")
 
-def load_model(model_path: str, device: torch.device) -> Union[UNet, ResNet34UNet]:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run inference and generate submission csv.")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        choices=["UNet", "ResNet34UNet"],
+        default=DEFAULT_MODEL_NAME,
+    )
+    parser.add_argument("--timestamp", type=str, default=DEFAULT_TIMESTAMP)
+    parser.add_argument(
+        "--use-swa",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_USE_SWA,
+        help="Use SWA checkpoint (<model>_swa.pth) instead of base checkpoint.",
+    )
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def get_test_split(model_name: str) -> str:
+    if model_name == "UNet":
+        return "test_unet.txt"
+    if model_name == "ResNet34UNet":
+        return "test_res_unet.txt"
+    raise ValueError(f"Invalid model name: {model_name}")
+
+
+def load_model(
+    model_path: str,
+    model_name: str,
+    device: torch.device,
+) -> Union[UNet, ResNet34UNet]:
 
     raw_state = torch.load(model_path, map_location = device, weights_only = True)
     state_dict = {k.removeprefix("_orig_mod."): v for k, v in raw_state.items()}
 
-    if MODEL_NAME == "UNet":
+    if model_name == "UNet":
         model = UNet().to(device)
-    elif MODEL_NAME == "ResNet34UNet":
+    elif model_name == "ResNet34UNet":
         model = ResNet34UNet().to(device)
     else:
-        raise ValueError(f"Invalid model name: {MODEL_NAME}")
+        raise ValueError(f"Invalid model name: {model_name}")
 
     model.load_state_dict(state_dict)
     model.eval()
@@ -130,6 +97,7 @@ def collect_sigmoid_probs(
     num_workers: int,
     desc: str,
 ) -> tuple[list[np.ndarray], list[int]]:
+    use_persistent_workers = num_workers > 0
 
     loader = DataLoader(
         dataset,
@@ -137,7 +105,7 @@ def collect_sigmoid_probs(
         shuffle = False,
         num_workers = num_workers,
         pin_memory = True,
-        persistent_workers = True
+        persistent_workers = use_persistent_workers,
     )
     all_probs: list[np.ndarray] = []
     all_idx: list[int] = []
@@ -206,58 +174,32 @@ def write_submission_csv(
 
 
 if __name__ == "__main__":
+    args = parse_args()
 
-    # Print Dice on your test split (two numbers: soft/hard).
-    save_dir = os.path.join("saved_models", MODEL_NAME, TIMESTAMP)
-    ckpt = os.path.join(save_dir, f"{MODEL_NAME}.pth")
+    model_name = args.model_name
+    timestamp = args.timestamp
+    use_swa = args.use_swa
+    test_split = get_test_split(model_name)
+
+    save_dir = os.path.join("saved_models", model_name, timestamp)
+    ckpt_name = f"{model_name}_swa.pth" if use_swa else f"{model_name}.pth"
+    ckpt = os.path.join(save_dir, ckpt_name)
 
     if not os.path.exists(ckpt):
-        raise SystemExit(f"Checkpoint not found: {ckpt} — update TIMESTAMP or path")
+        raise SystemExit(f"Checkpoint not found: {ckpt} -- update timestamp/path or SWA option")
 
-    model = load_model(ckpt, DEVICE)
+    model = load_model(ckpt, model_name, DEVICE)
     print(f"Checkpoint : {ckpt}")
-
-    test_ds = OxfordPetDataset(
-        root       = DATASET_ROOT,
-        split_file = TEST_SPLIT,
-        is_train   = False,
-        model_name = MODEL_NAME,
-        resize_map = RESIZE_MAP
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size         = BATCH_SIZE,
-        shuffle            = False,
-        num_workers        = NUM_WORKERS,
-        pin_memory         = True,
-        persistent_workers = True,
-    )
-
-    soft_sum = 0.0
-    hard_sum = 0.0
-    n = 0
-    with torch.no_grad():
-        for images, masks, _ in tqdm(test_loader, desc = "Test Dice", leave = False):
-            images = images.to(DEVICE)
-            masks = masks.to(DEVICE)
-            probs = torch.sigmoid(model(images))
-            soft, hard = dice_scores_from_probs(probs, masks, threshold=0.5)
-            soft_sum += float(soft.sum().item())
-            hard_sum += float(hard.sum().item())
-            n += int(soft.numel())
-
-    print(f"Soft Dice: {soft_sum / max(n, 1):.6f}")
-    print(f"Hard Dice: {hard_sum / max(n, 1):.6f}")
 
     write_submission_csv(
         model        = model,
-        model_name   = MODEL_NAME,
+        model_name   = model_name,
         dataset_root = DATASET_ROOT,
-        test_split   = TEST_SPLIT,
+        test_split   = test_split,
         save_dir     = save_dir,
         device       = DEVICE,
         batch_size   = BATCH_SIZE,
         num_workers  = NUM_WORKERS,
-        csv_name     = f"submission_{MODEL_NAME}.csv"
+        csv_name     = f"submission_{model_name}.csv"
     )
     

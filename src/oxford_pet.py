@@ -19,7 +19,7 @@ def train_transform() -> A.Compose:
         [
             A.HorizontalFlip(p = 0.5),
             A.SafeRotate(limit = 20, p = 0.5),
-            A.Blur(blur_limit = (3, 5), p = 0.5),
+            A.RandomBrightnessContrast(p = 0.5),
             A.Normalize(mean = [0.5070823478322863, 0.474229456630694, 0.4202200043649814], 
                         std = [0.2662919044873643, 0.26026855187836595, 0.26879510227266507]),
             ToTensorV2(),
@@ -128,6 +128,10 @@ class OxfordPetDataset(Dataset):
                           interpolation = F.InterpolationMode.NEAREST
                           )
 
+        # Ensure worker collation uses standalone, contiguous storages.
+        image_t = image_t.contiguous().clone()
+        mask_t = mask_t.contiguous().clone()
+
         return image_t, mask_t, idx
 
         return image, trimap, idx
@@ -142,14 +146,8 @@ if __name__ == "__main__":
         is_train = False,
         model_name = "UNet",
         resize_map = {
-            "UNet": {
-                "IMAGE_SIZE": (396, 396),
-                "MASK_SIZE": (396 - 184, 396 - 184),
-            },
-            "ResNet34UNet": {
-                "IMAGE_SIZE": (256, 256),
-                "MASK_SIZE": (256, 256),
-            }
+            "UNet": (388, 388),
+            "ResNet34UNet": (384, 384),
         }
     )
     

@@ -34,11 +34,9 @@ def save_training_config(
     weight_dice: float,
     weight_lovasz: float,
     patience: int,
-    onecycle_max_lr: float,
-    onecycle_pct_start: float,
-    onecycle_div_factor: float,
-    onecycle_final_div_factor: float,
-    onecycle_three_phase: bool,
+    warmup_epoch_ratio: float,
+    warmup_start_factor: float,
+    cosine_min_factor: float,
     swa_start_epoch: int,
     swa_lr: float,
     swa_anneal_epochs: int,
@@ -69,11 +67,9 @@ def save_training_config(
     tqdm.write(row("Batch Size",          batch_size))
     tqdm.write(row("Learning Rate",       f"{learning_rate:.4g}"))
     tqdm.write(row("Weight Decay",        f"{weight_decay:.4g}"))
-    tqdm.write(row("OneCycle Max LR",     f"{onecycle_max_lr:.4g}"))
-    tqdm.write(row("OneCycle Pct Start",  onecycle_pct_start))
-    tqdm.write(row("OneCycle Div Factor", onecycle_div_factor))
-    tqdm.write(row("OneCycle Final Div",  onecycle_final_div_factor))
-    tqdm.write(row("OneCycle 3-Phase",    onecycle_three_phase))
+    tqdm.write(row("Warmup Epoch Ratio",  warmup_epoch_ratio))
+    tqdm.write(row("Warmup Start Factor", warmup_start_factor))
+    tqdm.write(row("Cosine Min Factor",   cosine_min_factor))
     tqdm.write(row("SWA Start Epoch",     swa_start_epoch))
     tqdm.write(row("SWA LR",              f"{swa_lr:.4g}"))
     tqdm.write(row("SWA Anneal Epochs",   swa_anneal_epochs))
@@ -103,11 +99,9 @@ def save_training_config(
             "Batch Size": batch_size,
             "Learning Rate": learning_rate,
             "Weight Decay": weight_decay,
-            "OneCycle Max LR": onecycle_max_lr,
-            "OneCycle Pct Start": onecycle_pct_start,
-            "OneCycle Div Factor": onecycle_div_factor,
-            "OneCycle Final Div Factor": onecycle_final_div_factor,
-            "OneCycle Three Phase": onecycle_three_phase,
+            "Warmup Epoch Ratio": warmup_epoch_ratio,
+            "Warmup Start Factor": warmup_start_factor,
+            "Cosine Min Factor": cosine_min_factor,
             "SWA Start Epoch": swa_start_epoch,
             "SWA LR": swa_lr,
             "SWA Anneal Epochs": swa_anneal_epochs,

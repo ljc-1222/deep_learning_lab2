@@ -1,0 +1,163 @@
+# Short Technical Summary
+
+    ## Disclosure
+
+        I used Cursor to help generate some part of the code for faster development.
+        Also, some of the training strategies are inspired by Gemini.
+
+    ## Quick Start
+
+        To setup the environment, you can use the following command:
+
+        ```bash
+        source setup.sh
+        ```
+
+        Then, you can train the UNet model by:
+
+        ```bash
+        python -m src.train \
+            --model-name UNet \
+            --device cuda \
+            --num-epochs 250 \
+            --batch-size 16 \
+            --learning-rate 1.5e-4 \
+            --weight-decay 3e-4 \
+            --warmup-epoch-ratio 0.08 \
+            --warmup-start-factor 0.05 \
+            --cosine-min-factor 0.01 \
+            --swa-start-epoch 135 \
+            --swa-lr 1e-5 \
+            --swa-anneal-epochs 10 \
+            --patience 30 \
+            --weight-bce 0.1 \
+            --weight-dice 0.9 \
+            --weight-lovasz 0.005
+        ```
+
+        and the ResNet34_UNet model by:
+
+        ```bash
+        python -m src.train \
+            --model-name ResNet34UNet \
+            --device cuda \
+            --num-epochs 250 \
+            --batch-size 16 \
+            --learning-rate 1.5e-4 \
+            --weight-decay 3e-4 \
+            --warmup-epoch-ratio 0.08 \
+            --warmup-start-factor 0.05 \
+            --cosine-min-factor 0.01 \
+            --swa-start-epoch 135 \
+            --swa-lr 1e-5 \
+            --swa-anneal-epochs 10 \
+            --patience 30 \
+            --weight-bce 0.1 \
+            --weight-dice 0.9 \
+            --weight-lovasz 0.005
+        ```
+        The training results will be saved in the saved_models directory.
+        You can also run the inference script by:
+
+        ```bash
+        python -m src.inference \
+            --model-name UNet \
+            --timestamp 20260331-100231 \
+            --use-swa
+        ```
+
+        and the ResNet34_UNet model by:
+
+        ```bash
+        python -m src.inference \
+            --model-name ResNet34UNet \
+            --timestamp 20260331-094415 \
+            --use-swa
+        ```
+
+        The inference results will be saved in the folder where the model is saved.
+
+    ## Implementation Highlights
+
+        I clearly recorded the training details in the training_config.json file.
+        Also, I used the training_results.json file to record the training results.
+        The loss curves and dice scores are saved in the loss_curves.png and dice_scores.png files.
+        These information are useful when conducting the experiments.
+
+        To speed up the training process, torch.compile, mixed precision training, and persistent workers are used.
+
+    ## Data processing strategies
+
+        ### Preprocessing
+
+            To make the model more robust, 
+            I first applied CLAHE (Contrast Limited Adaptive Histogram Equalization) to the images,
+            which can enhance the detail and reduce the noise of the images.
+
+            Then, data augmentation is applied to the images and masks.
+            Horizontal flip, safe rotate, random brightness contrast, and normalization are applied.
+
+            Finally, the images and masks are resized to the target size.
+            For the UNet case, since the output shape would not be the same as the input shape,
+            I padded the image to a larger size with reflection padding
+            such that the output shape is the same as the target size.
+
+            As for the ResNet34_UNet case, I resized the images and masks to the target size directly.
+
+        ### Postprocessing
+
+            After the model is trained, I've tried to apply some postprocessing to the predictions.
+            I've tried techniques like TTA, thresholding, Morphological Operations, etc.
+            However, none of them are obviously effective, so I didn't apply them in the final submission.
+
+    ## Training Strategies
+
+        ### Loss Function
+
+            I used the combined loss function.
+            The loss function is a weighted sum of the BCE loss, Dice loss, and Lovasz loss.
+            The weights are 0.1, 0.9, and 0.005 respectively.
+
+        ### Learning Rate Scheduler
+
+            I used the warmup and cosine annealing learning rate scheduler.
+            The warmup period is 8% of the total training epochs with a start factor of 0.05.
+            The cosine annealing period is the remaining 92% of the total training epochs.
+            The minimum learning rate is 0.01 of the initial learning rate.
+
+            After these, I used the SWA (Stochastic Weight Averaging) technique to further improve the performance.
+            The SWA is triggered when the training epochs reach the SWA start epoch.
+
+        ### Early Stopping
+
+            I used the early stopping technique in the SWA training process to prevent overfitting.
+            The early stopping is triggered when the validation loss does not improve for 30 consecutive epochs.
+            The best model is saved based on the validation loss.
+
+    ## Key observations
+
+        The most important observation is about the Unet.
+        Since the architecture of the UNet is not optimal for the task,
+        for example, the output shape is not the same as the input shape,
+        and no batch normalization is applied,
+        which makes the model harder to train.
+
+        To make the UNet model converge well, two techniques are applied:
+        1. Padding the image to a larger size.
+        2. Use reflection padding to pad the image.
+
+        The ResNet34_UNet model is more robust and can converge well without these techniques.
+        Also, it costs less time to train the ResNet34_UNet model,
+        that might be because of the batch normalization layers and the larger model size.
+
+    ## Comparison between UNet and ResNet34_UNet
+
+        As I discussed in the last section, 
+        the ResNet34_UNet model is more robust and can converge better than the UNet model.
+        Its training loss drops faster and the dice score is higher.
+        Also, less time is needed to train the ResNet34_UNet model.
+
+        Beyond the regulation of this assignment,
+        I also tried the UNet model with padding batch normalization,
+        which not only saves the time that appplying padding to the input image,
+        but also makes its performance be closer to that of the ResNet34_UNet model.

@@ -10,20 +10,29 @@ from PIL import Image
 from torch.utils.data import Dataset
 from albumentations.pytorch import ToTensorV2
 
-IMAGE_SIZE: int = 572
-MASK_SIZE:  int = 388
+RESIZE_MAP = {
+    "UNet": {
+        "IMAGE_SIZE": 364,
+        "MASK_SIZE": 180,
+    },
+    "ResNet34UNet": {
+        "IMAGE_SIZE": 384,
+        "MASK_SIZE": 384,
+    }
+}
 
 def train_transform() -> A.Compose:
 
     return A.Compose(
         [
             A.HorizontalFlip(p = 0.5),
-            A.RandomResizedCrop(size = (IMAGE_SIZE, IMAGE_SIZE), scale = (0.8, 1)),
-            A.ShiftScaleRotate(
-                shift_limit  = 0.2,
-                scale_limit  = 0.2,
-                rotate_limit = 30,
-                p            = 0.5,
+            A.VerticalFlip(p = 0.5),
+            A.Affine(
+                shear = 10,
+                scale = 0.1,
+                translate_percent = 0.1,
+                rotate = 10,
+                p = 0.5,
             ),
             A.ColorJitter(
                 brightness = 0.2,
@@ -53,18 +62,16 @@ class OxfordPetDataset(Dataset):
         root: Union[str, Path],
         split_file: Union[str, Path],
         is_train: bool = False,
-        transform: Optional[A.Compose] = None,
+        model_name: str = "UNet",
     ) -> None:
         
         self.root = Path(root)
         self.split_file = self.root / split_file
         self.is_train = is_train
-        if transform is not None:
-            self.transform = transform
-        else:
-            self.transform = train_transform() if is_train else eval_transform()
+        self.transform = train_transform() if is_train else eval_transform()
+        self.model_name = model_name
 
-        with open(self.split_file, "r", encoding="utf-8") as f:
+        with open(self.split_file, "r", encoding = "utf-8") as f:
             sample_ids = [line.strip() for line in f if line.strip()]
 
         self.image_list = [
@@ -102,8 +109,16 @@ class OxfordPetDataset(Dataset):
         image_t = transformed["image"]
         mask_t = transformed["mask"].unsqueeze(0)
         
-        image_t = F.resize(image_t, size = (IMAGE_SIZE, IMAGE_SIZE), interpolation = F.InterpolationMode.NEAREST)
-        mask_t = F.resize(mask_t, size = (MASK_SIZE, MASK_SIZE), interpolation = F.InterpolationMode.NEAREST)
+        image_t = F.resize(image_t, 
+                           size = (RESIZE_MAP[self.model_name]["IMAGE_SIZE"], 
+                                   RESIZE_MAP[self.model_name]["IMAGE_SIZE"]), 
+                           interpolation = F.InterpolationMode.NEAREST
+                           )
+        mask_t  = F.resize(mask_t, 
+                           size = (RESIZE_MAP[self.model_name]["MASK_SIZE"], 
+                                   RESIZE_MAP[self.model_name]["MASK_SIZE"]), 
+                           interpolation = F.InterpolationMode.NEAREST
+                           )
 
         return image_t, mask_t, idx
 
@@ -115,6 +130,7 @@ if __name__ == "__main__":
         root = "dataset/oxford-iiit-pet",
         split_file = "train.txt",
         is_train = False,
+        model_name = "UNet",
     )
     
     image, trimap, idx = dataset[0]

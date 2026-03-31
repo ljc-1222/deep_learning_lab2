@@ -82,4 +82,4 @@ if __name__ == "__main__":
     import torchinfo
 
     model = UNet()
-    torchinfo.summary(model, input_size = (1, 3, 528, 528))
+    torchinfo.summary(model, input_size = (1, 3, 364, 364))

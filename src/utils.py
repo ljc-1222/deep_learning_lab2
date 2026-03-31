@@ -1,8 +1,22 @@
 import os
 import json
 import matplotlib.pyplot as plt
+import numpy as np
 
 from tqdm import tqdm
+
+
+def rle_encode(mask: np.ndarray) -> str:
+    
+    binary = (mask > 0).astype(np.uint8)
+    if binary.sum() == 0:
+        return ""
+    pixels = np.ravel(binary, order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return " ".join(str(int(x)) for x in runs)
+
 
 def save_training_config(
     save_dir: str,
@@ -14,12 +28,13 @@ def save_training_config(
     batch_size: int,
     learning_rate: float,
     weight_decay: float,
-    dice_alpha: float,
-    tv_beta: float,
+    combined_loss_weight: float,
     patience: int,
     warmup_epochs: int,
     warmup_factor: float,
     eta_min_rate: float,
+    use_bf16: bool,
+    cudnn_benchmark: bool,
     width: int = 60,
 ) -> None:
     
@@ -36,6 +51,9 @@ def save_training_config(
     tqdm.write(row("Start Time",          run_timestamp))
     tqdm.write(row("Device",              device))
     tqdm.write(row("Model",               model_name))
+    amp_dtype = "bfloat16" if use_bf16 else "float32"
+    tqdm.write(row("AMP dtype",           amp_dtype))
+    tqdm.write(row("cuDNN benchmark",     cudnn_benchmark))
     tqdm.write("╠" + "─" * W + "╣")
     tqdm.write(row("Epochs",              num_epochs))
     tqdm.write(row("Batch Size",          batch_size))
@@ -46,7 +64,13 @@ def save_training_config(
     tqdm.write(row("ETA Min Rate",        eta_min_rate))
     tqdm.write(row("Early Stop Patience", patience))
     tqdm.write("╠" + "─" * W + "╣")
-    tqdm.write(row("Loss",                f"CE + {dice_alpha}×Dice + {tv_beta}×TV"))
+    dice_w = 1.0 - combined_loss_weight
+    tqdm.write(
+        row(
+            "Loss",
+            f"{combined_loss_weight}×BCE + {dice_w}×Dice",
+        )
+    )
     tqdm.write(row("Checkpoint",          os.path.basename(best_model_path)))
     tqdm.write("╚" + "═" * W + "╝")
     tqdm.write("")
@@ -57,6 +81,9 @@ def save_training_config(
             "Run Timestamp": run_timestamp,
             "Device": device,
             "Model": model_name,
+            "AMP dtype": "bfloat16" if use_bf16 else "float32",
+            "use_bf16": use_bf16,
+            "cuDNN benchmark": cudnn_benchmark,
             "Epochs": num_epochs,
             "Batch Size": batch_size,
             "Learning Rate": learning_rate,
@@ -65,7 +92,10 @@ def save_training_config(
             "Warmup Factor": warmup_factor,
             "ETA Min Rate": eta_min_rate,
             "Early Stop Patience": patience,
-            "Loss": f"CE + {dice_alpha} * Dice + {tv_beta} * TV",
+            "Combined Loss Weight (BCE)": combined_loss_weight,
+            "Loss": (
+                f"{combined_loss_weight} * BCE + {1.0 - combined_loss_weight} * Dice"
+            ),
         }, f, indent = 4)
 
 
@@ -95,11 +125,11 @@ def save_training_results(
 
     # save dice scores curves
     fig2, ax2 = plt.subplots(figsize=(8, 5))
-    ax2.plot(epochs, train_dice_scores, color="steelblue", linewidth=1.5, label = "Train Dice Score")
-    ax2.plot(epochs, val_dice_scores, color="seagreen", linewidth=1.5, label = "Val Dice Score")
+    ax2.plot(epochs, train_dice_scores, color="steelblue", linewidth=1.5, label = "Train Soft Dice")
+    ax2.plot(epochs, val_dice_scores, color="seagreen", linewidth=1.5, label = "Val Soft Dice")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Dice Score")
-    ax2.set_title("Training & Validation Dice Score")
+    ax2.set_ylabel("Soft Dice")
+    ax2.set_title("Training & Validation Soft Dice")
     ax2.legend()
     ax2.grid(True, alpha = 0.3)
     fig2.tight_layout()
@@ -109,6 +139,8 @@ def save_training_results(
 
     # save training results as csv
     with open(os.path.join(save_dir, "training_results.csv"), "w") as f:
-        f.write("Epoch,Train Loss,Train Dice Score,Val Loss,Val Dice Score\n")
+        f.write("Epoch,Train Loss,Train Soft Dice,Val Loss,Val Soft Dice\n")
         for i in range(len(epochs)):
             f.write(f"{epochs[i]},{train_losses[i]},{train_dice_scores[i]},{val_losses[i]},{val_dice_scores[i]}\n")
+            
+    print(f"Saved → {os.path.join(save_dir, 'training_results.csv')}")
